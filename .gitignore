@@ -1,0 +1,10 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# Local memnon store files created by examples/tests
+*.db
+
+# OS / editor noise
+.DS_Store

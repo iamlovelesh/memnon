@@ -1,0 +1,15 @@
+[package]
+name = "memnon"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+description = "Embeddable, local-first memory engine for AI agents — SQLite for agent memory."
+repository = "https://github.com/iamlovelesh/memnon"
+keywords = ["ai", "agents", "memory", "embeddings", "local-first"]
+categories = ["database-implementations", "science"]
+readme = "README.md"
+
+# Dependencies are intentionally empty at the skeleton stage. They are chosen
+# during the implementation plan — current lean: `redb` (pure-Rust, single-file
+# embedded store) for storage. See docs/specs/*-design.md §6 "Left to the Builder".
+[dependencies]
