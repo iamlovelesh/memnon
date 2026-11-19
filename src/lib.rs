@@ -10,7 +10,9 @@ pub mod error;
 pub mod query;
 pub mod types;
 
+pub(crate) mod index;
+
 pub use embedder::{Embedder, HashEmbedder};
 pub use error::{Error, Result};
-pub use query::Query;
+pub use query::{Budget, Query};
 pub use types::{Entry, MemoryId, Scope};

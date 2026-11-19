@@ -11,8 +11,14 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MemoryId(u64);
 
-// NOTE: the `new`/`raw` constructors arrive in Task 4, when the storage layer
-// mints ids and keys on them. Adding them now would be untested dead code.
+impl MemoryId {
+    /// Mint an id. Crate-internal: storage allocates these; tests construct them.
+    // `raw()` (reading the inner value, for storage keys) arrives in Task 4.
+    #[allow(dead_code)] // non-test lib build has no caller until storage (Task 4)
+    pub(crate) fn new(raw: u64) -> Self {
+        MemoryId(raw)
+    }
+}
 
 impl fmt::Display for MemoryId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

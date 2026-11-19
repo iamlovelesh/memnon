@@ -4,6 +4,17 @@
 
 use crate::types::Scope;
 
+/// How much to return from a recall. `Tokens` is the headline context-management
+/// path: the most-similar memories that *fit* the budget, not a fixed `k`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub enum Budget {
+    /// Return the top `n` most similar memories.
+    TopK(usize),
+    /// Return the most similar memories that together fit within this many tokens.
+    Tokens(usize),
+}
+
 /// Constraints for a recall, built fluently. Kept as a builder so `search`'s
 /// signature stays stable as richer filters are added later.
 ///
