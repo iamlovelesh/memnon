@@ -86,6 +86,36 @@ Full rationale, non-goals, and approaches:
 [`docs/specs/2026-11-18-local-first-memory-engine-design.md`](docs/specs/2026-11-18-local-first-memory-engine-design.md).
 Build plan: [`docs/plans/2026-11-18-memnon-v1-implementation-plan.md`](docs/plans/2026-11-18-memnon-v1-implementation-plan.md).
 
+## How it compares
+
+| | memnon | Mem0 / Zep / Letta | LanceDB / sqlite-vec |
+|---|---|---|---|
+| Runs embedded, in-process | ✅ | ❌ (service / Python stack) | ✅ |
+| Fully offline, single file | ✅ | ❌ | ✅ (vector store only) |
+| Memory semantics (scopes, recall API) | ✅ | ✅ | ❌ (you build it) |
+| **Token-budget-first recall** | ✅ | ❌ | ❌ |
+| LLM conflict resolution | ⏳ v2 | ✅ | ❌ |
+| ANN index at scale | ⏳ v1.1 (HNSW) | ✅ | ✅ |
+| Language reach | Rust (sidecar → any, v2) | Python-first | Rust / SQL |
+
+memnon isn't a vector DB and isn't trying to beat Mem0 on features — it owns the
+**embeddable + local-first + token-budget-packing** corner the others don't fill.
+
+## Benchmarks
+
+Exact brute-force cosine, 384-dim vectors, `Budget::Tokens(2000)`, `cargo bench`
+on a developer laptop (indicative, not a datacenter number):
+
+| Memories in scope | Search latency |
+|---|---|
+| 1,000 | ~0.8 ms |
+| 10,000 | ~9 ms |
+| 50,000 | ~50 ms |
+
+Latency scales linearly (~1 ms per 1k memories), so v1 is comfortable to roughly
+**50k memories per scope** and crosses ~100 ms near ~100k — which is where the
+v1.1 HNSW index earns its place. Reproduce with `cargo bench`.
+
 ## Honest scope & limitations (read before adopting)
 
 - **Rust only (v1).** memnon is embeddable from Rust today. "SQLite for agent
