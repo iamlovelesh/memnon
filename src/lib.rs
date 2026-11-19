@@ -8,6 +8,7 @@
 pub mod embedder;
 pub mod error;
 pub mod query;
+pub mod store;
 pub mod types;
 
 pub(crate) mod index;
@@ -16,4 +17,5 @@ pub(crate) mod storage;
 pub use embedder::{Embedder, HashEmbedder};
 pub use error::{Error, Result};
 pub use query::{Budget, Query};
-pub use types::{Entry, Memory, MemoryId, Scope};
+pub use store::MemoryStore;
+pub use types::{Entry, Hit, Memory, MemoryId, Scope};

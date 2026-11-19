@@ -1,10 +1,7 @@
 //! Single-file storage over `redb`: versioned records, a monotonic id counter,
 //! exact-dedup, and an atomically-pinned embedder identity.
 //!
-//! Crate-internal; the store (Task 5) orchestrates these. Unit-tested below.
-
-// Consumed by the store in Task 5; unreachable in a non-test build until then.
-#![allow(dead_code)]
+//! Crate-internal; the store orchestrates these. Unit-tested below.
 
 use crate::error::{Error, Result};
 use crate::types::{Memory, MemoryId, Scope};
@@ -62,27 +59,14 @@ impl Storage {
                 }
             }
         }
+        // Create the data tables up front so reads on a fresh store return empty
+        // instead of failing with "table does not exist".
+        {
+            wtxn.open_table(MEMORIES).map_err(io)?;
+            wtxn.open_table(DEDUP).map_err(io)?;
+        }
         wtxn.commit().map_err(io)?;
         Ok(Storage { db })
-    }
-
-    /// The pinned embedder identity + dimension, if one has been recorded.
-    pub(crate) fn embedder_identity(&self) -> Result<Option<(String, usize)>> {
-        let rtxn = self.db.begin_read().map_err(io)?;
-        let meta = rtxn.open_table(META).map_err(io)?;
-        let identity = meta
-            .get(KEY_EMB_IDENTITY)
-            .map_err(io)?
-            .map(|g| String::from_utf8_lossy(g.value()).into_owned());
-        let dims = meta
-            .get(KEY_EMB_DIMS)
-            .map_err(io)?
-            .map(|g| read_u64(g.value()))
-            .transpose()?;
-        Ok(match (identity, dims) {
-            (Some(i), Some(d)) => Some((i, d as usize)),
-            _ => None,
-        })
     }
 
     /// Atomically initialize-or-read the embedder identity in one write txn: if
@@ -179,13 +163,14 @@ impl Storage {
         }
     }
 
-    /// Light projection for ranking: `(id, embedding, created_at)` for every memory
-    /// in `scope` (or all scopes if `None`) matching all metadata `filters`.
-    pub(crate) fn projection(
+    /// Candidate memories for a recall: every memory in `scope` (or all scopes if
+    /// `None`) matching all metadata `filters`. Full rows — the store ranks and
+    /// token-packs from these without a second read.
+    pub(crate) fn candidates(
         &self,
         scope: Option<&Scope>,
         filters: &[(String, String)],
-    ) -> Result<Vec<(MemoryId, Vec<f32>, u64)>> {
+    ) -> Result<Vec<Memory>> {
         let rtxn = self.db.begin_read().map_err(io)?;
         let memories = rtxn.open_table(MEMORIES).map_err(io)?;
         let mut out = Vec::new();
@@ -197,20 +182,7 @@ impl Storage {
                 .iter()
                 .all(|(k, val)| mem.metadata.get(k).map(String::as_str) == Some(val.as_str()));
             if scope_ok && meta_ok {
-                out.push((mem.id, mem.embedding, mem.created_at));
-            }
-        }
-        Ok(out)
-    }
-
-    /// Full rows for a set of ids, in the given order, skipping any that are gone.
-    pub(crate) fn rows(&self, ids: &[MemoryId]) -> Result<Vec<Memory>> {
-        let rtxn = self.db.begin_read().map_err(io)?;
-        let memories = rtxn.open_table(MEMORIES).map_err(io)?;
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(v) = memories.get(id.raw()).map_err(io)? {
-                out.push(decode_record(v.value())?);
+                out.push(mem);
             }
         }
         Ok(out)
@@ -450,10 +422,6 @@ mod tests {
             s.init_embedder_identity_atomic("ada", 32).unwrap(),
             ("bge".to_string(), 16)
         );
-        assert_eq!(
-            s.embedder_identity().unwrap(),
-            Some(("bge".to_string(), 16))
-        );
     }
 
     #[test]
@@ -486,8 +454,8 @@ mod tests {
             item(Scope::LongTerm, "l1", vec![1.0], 1),
         ])
         .unwrap();
-        assert_eq!(s.projection(Some(&Scope::LongTerm), &[]).unwrap().len(), 1);
-        assert_eq!(s.projection(None, &[]).unwrap().len(), 2);
+        assert_eq!(s.candidates(Some(&Scope::LongTerm), &[]).unwrap().len(), 1);
+        assert_eq!(s.candidates(None, &[]).unwrap().len(), 2);
         assert_eq!(s.get_all(&Scope::Session).unwrap().len(), 1);
     }
 
@@ -507,7 +475,7 @@ mod tests {
         ])
         .unwrap();
         let hits = s
-            .projection(None, &[("source".to_string(), "docs".to_string())])
+            .candidates(None, &[("source".to_string(), "docs".to_string())])
             .unwrap();
         assert_eq!(hits.len(), 1);
     }

@@ -12,9 +12,6 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MemoryId(u64);
 
-// `new`/`raw` are used by the storage layer; until the store wires storage into
-// the public API (Task 5) they're unreachable in a non-test build.
-#[allow(dead_code)]
 impl MemoryId {
     /// Mint an id. Crate-internal: storage allocates these; tests construct them.
     pub(crate) fn new(raw: u64) -> Self {
@@ -58,6 +55,10 @@ impl Entry {
     }
     pub fn metadata(&self) -> &HashMap<String, String> {
         &self.metadata
+    }
+    /// Consume the entry into its parts, so callers can store them without cloning.
+    pub(crate) fn into_parts(self) -> (String, HashMap<String, String>) {
+        (self.content, self.metadata)
     }
 }
 
@@ -104,4 +105,11 @@ pub struct Memory {
     pub created_at: u64,
     /// Unix epoch milliseconds. Equals `created_at` in v1.
     pub updated_at: u64,
+}
+
+/// A recall result: the memory plus the cosine similarity that ranked it.
+#[derive(Debug, Clone)]
+pub struct Hit {
+    pub memory: Memory,
+    pub score: f32,
 }

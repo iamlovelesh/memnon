@@ -1,11 +1,7 @@
 //! Recall math: similarity, token estimation, ranking, and budget packing.
 //!
 //! Pure functions, unit-tested below. These are crate-internal; the store
-//! (Task 5) wires them into `search`.
-
-// These are consumed by the store in Task 5. Until then only the unit tests
-// below exercise them in a non-`cfg(test)` build. Remove when the store lands.
-#![allow(dead_code)]
+//! wires them into `search`.
 
 use crate::query::Budget;
 use crate::types::MemoryId;
