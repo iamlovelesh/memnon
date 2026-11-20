@@ -13,7 +13,7 @@
 use crate::index::cosine;
 use crate::types::MemoryId;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 const M: usize = 16; // max neighbors per node on layers > 0
 const M0: usize = 32; // max neighbors on layer 0 (denser)
@@ -56,6 +56,11 @@ struct Node {
 
 pub(crate) struct HnswIndex {
     nodes: Vec<Node>,
+    /// Maps a `MemoryId` to its node index, so `insert` is idempotent: inserting
+    /// an id that already exists is a no-op. This keeps the index consistent even
+    /// if a concurrent lazy-build and an incremental `add` both try to insert the
+    /// same row (the build reads committed storage; the add re-inserts).
+    ids: HashMap<MemoryId, u32>,
     entry: Option<u32>,
     top_layer: usize,
     rng: Xorshift,
@@ -65,6 +70,7 @@ impl HnswIndex {
     pub(crate) fn new() -> Self {
         Self {
             nodes: Vec::new(),
+            ids: HashMap::new(),
             entry: None,
             top_layer: 0,
             rng: Xorshift::new(0x2545F4914F6CDD1D),
@@ -88,10 +94,15 @@ impl HnswIndex {
 
     /// Insert a vector. Idempotency/dedup is the store's job; this just adds a node.
     pub(crate) fn insert(&mut self, id: MemoryId, vector: Vec<f32>) {
+        // Idempotent: never add a second node for an id already in the index.
+        if self.ids.contains_key(&id) {
+            return;
+        }
         let level = self.random_level().min(MAX_LEVEL);
         // Node indices are u32; the store rebuilds the index per process and caps
         // well below 4B nodes in practice, so this cast can't realistically wrap.
         let new_idx = self.nodes.len() as u32;
+        self.ids.insert(id, new_idx);
         self.nodes.push(Node {
             id,
             vector,
@@ -318,6 +329,15 @@ mod tests {
         let mut idx = HnswIndex::new();
         idx.insert(mid(1), vec![1.0, 0.0]);
         assert_eq!(idx.search(&[1.0, 0.0], 1, 16), vec![mid(1)]);
+    }
+
+    #[test]
+    fn insert_is_idempotent_on_repeated_id() {
+        let mut idx = HnswIndex::new();
+        idx.insert(mid(1), vec![1.0, 0.0]);
+        idx.insert(mid(1), vec![1.0, 0.0]); // same id again -> no-op
+        assert_eq!(idx.len(), 1);
+        assert_eq!(idx.search(&[1.0, 0.0], 5, 16), vec![mid(1)]);
     }
 
     #[test]

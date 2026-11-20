@@ -4,14 +4,15 @@
 context-window budget; it returns exactly the memories that fit — most-relevant
 first, with scores — **offline and in-process.**
 
-> ⚠️ **Status: design / API skeleton.** The public API in `src/lib.rs` compiles
-> but is **not implemented** (`todo!()` bodies). This repo currently exists to
-> review the shape. Implementation follows the TDD plan in `docs/plans/`.
+> ℹ️ **Status: implemented and tested (pre-1.0).** v1 (store, scopes, token-budget
+> recall), a from-scratch HNSW index, and an optional on-device semantic embedder
+> are all in and under test. Not yet published to crates.io; APIs may still change
+> before 1.0.
 >
 > ℹ️ **This is a learning-first project.** Its author is using it to learn Rust
 > and AI engineering by building the internals. It aims to become a genuinely
-> useful OSS library, but v1 is a `cargo add` Rust library — broad, cross-language
-> adoption is a deliberate later step (see *Honest scope*).
+> useful OSS library, but today it's a `cargo add` Rust library — broad,
+> cross-language adoption is a deliberate later step (see *Honest scope*).
 
 ---
 
@@ -89,6 +90,10 @@ let store = MemoryStore::open("./memory.db", memnon::FastEmbedEmbedder::new()?)?
 It downloads a small model (~90 MB, all-MiniLM-L6-v2) once, then runs **fully
 offline, on-device**. Try it:
 `cargo run --example semantic_quickstart --features fastembed`.
+
+> Note: the `fastembed` feature pulls a heavy native ONNX stack (currently a
+> pre-1.0 `ort` release). Fine for applications; worth knowing if you vendor or
+> audit dependencies.
 
 (Or bring your own: implement [`Embedder`] over any model/API — see
 `examples/openai_embedder.rs`.)

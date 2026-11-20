@@ -494,6 +494,28 @@ mod tests {
     }
 
     #[test]
+    fn record_decode_rejects_short_and_future_version() {
+        let (_d, s) = temp_store();
+        // Write malformed records straight into the MEMORIES table.
+        {
+            let w = s.db.begin_write().unwrap();
+            {
+                let mut t = w.open_table(MEMORIES).unwrap();
+                t.insert(1u64, [1u8, 2, 3].as_slice()).unwrap(); // shorter than the version tag
+                let mut future = 999u32.to_le_bytes().to_vec();
+                future.extend_from_slice(&[0u8; 8]); // future record version + body
+                t.insert(2u64, future.as_slice()).unwrap();
+            }
+            w.commit().unwrap();
+        }
+        assert!(matches!(s.get(MemoryId::new(1)), Err(Error::Corrupt(_))));
+        assert!(matches!(
+            s.get(MemoryId::new(2)),
+            Err(Error::UnsupportedSchema { found: 999, .. })
+        ));
+    }
+
+    #[test]
     fn projection_and_get_all_filter_by_scope() {
         let (_d, s) = temp_store();
         s.insert_batch(&[

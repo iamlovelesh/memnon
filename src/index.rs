@@ -45,7 +45,18 @@ pub(crate) fn rank(
 ) -> Vec<(MemoryId, f32)> {
     let mut scored: Vec<(MemoryId, f32, u64)> = candidates
         .iter()
-        .map(|(id, embedding, created_at)| (*id, cosine(query, embedding), *created_at))
+        .map(|(id, embedding, created_at)| {
+            let score = cosine(query, embedding);
+            // Defense-in-depth: a non-finite score (e.g. legacy data written before
+            // the ingest guard) sorts LAST, not first — `total_cmp` would otherwise
+            // place NaN above every real score.
+            let score = if score.is_finite() {
+                score
+            } else {
+                f32::NEG_INFINITY
+            };
+            (*id, score, *created_at)
+        })
         .collect();
 
     // Sort by score desc, then created_at desc (recency), then id asc as a final

@@ -28,16 +28,19 @@ jobs:
         run: cargo build --examples
 
   features:
-    name: build (fastembed feature)
+    name: lint (fastembed feature)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Compile-only: pulls the ONNX stack but does not download a model or run
-      # inference (that lives behind an #[ignore]d test).
-      - name: Check with fastembed
-        run: cargo check --features fastembed --all-targets
+      # Compile + lint the feature path. Pulls the ONNX stack but does NOT
+      # download a model or run inference (that lives behind an #[ignore]d test;
+      # run it manually with `--features fastembed -- --ignored`).
+      - name: Clippy with fastembed
+        run: cargo clippy --features fastembed --all-targets -- -D warnings
 
   coverage:
     name: coverage (report only)

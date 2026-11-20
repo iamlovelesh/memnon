@@ -374,7 +374,7 @@ fn hnsw_path_top_k_tracks_brute_force() {
     let all = s.get_all(Scope::LongTerm).unwrap();
     let mut scored: Vec<(f32, &str)> = all
         .iter()
-        .map(|m| (cos(&q, &m.embedding), m.content.as_str()))
+        .map(|m| (cos(&q, m.embedding()), m.content.as_str()))
         .collect();
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
     let brute_top: Vec<&str> = scored.iter().take(10).map(|(_, c)| *c).collect();
@@ -415,6 +415,76 @@ fn concurrent_add_and_search_do_not_deadlock() {
         h.join().unwrap();
     }
     assert!(s.count(&Scope::LongTerm).unwrap() >= 100);
+}
+
+#[test]
+fn incremental_index_finds_rows_added_after_first_search() {
+    // Regression for the "extended incrementally on add" path: it only runs when
+    // an index is already built, which needs a search BEFORE the add on a large store.
+    let (_d, s) = store();
+    let bulk: Vec<String> = (0..2100)
+        .map(|i| format!("note {i} group {}", i % 20))
+        .collect();
+    s.add(
+        bulk.iter().map(String::as_str).collect::<Vec<_>>(),
+        Scope::LongTerm,
+    )
+    .unwrap();
+    // Build the HNSW index.
+    let _ = s
+        .search("note 5 group 5", Query::new(), Budget::TopK(3))
+        .unwrap();
+
+    // Now add a distinctive row; the incremental insert must put it in the index.
+    s.add(["note 5 group 5 freshly added marker"], Scope::LongTerm)
+        .unwrap();
+    let hits = s
+        .search(
+            "note 5 group 5 freshly added marker",
+            Query::new(),
+            Budget::TopK(1),
+        )
+        .unwrap();
+    assert_eq!(
+        hits[0].memory.content,
+        "note 5 group 5 freshly added marker"
+    );
+}
+
+#[test]
+fn large_store_delete_then_search_excludes_deleted() {
+    let (_d, s) = store();
+    // Same reachable content shape as the other large-store tests (enough tokens
+    // that the exact match is distinct, not lost in a flat cluster).
+    let bulk: Vec<String> = (0..2100)
+        .map(|i| format!("filler memory {i} about topic {}", i % 50))
+        .collect();
+    s.add(
+        bulk.iter().map(String::as_str).collect::<Vec<_>>(),
+        Scope::LongTerm,
+    )
+    .unwrap();
+
+    let target = "filler memory 1234 about topic 34"; // 1234 % 50 == 34
+    let id = s
+        .get_all(Scope::LongTerm)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.content == target)
+        .unwrap()
+        .id;
+
+    // Build the index + confirm the target is found.
+    let hits = s.search(target, Query::new(), Budget::TopK(1)).unwrap();
+    assert_eq!(hits[0].memory.content, target);
+
+    // Delete invalidates the index; the next search rebuilds without the row.
+    s.delete(id).unwrap();
+    let hits = s.search(target, Query::new(), Budget::TopK(3)).unwrap();
+    assert!(
+        hits.iter().all(|h| h.memory.id != id),
+        "deleted row resurfaced"
+    );
 }
 
 #[test]

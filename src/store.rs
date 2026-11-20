@@ -121,8 +121,10 @@ impl MemoryStore {
     /// returning scored [`Hit`]s most-relevant first.
     ///
     /// Scoped/filtered queries and small stores are searched exactly. Large
-    /// *unfiltered* stores use the HNSW index (approximate) with the candidate pool
-    /// sized to the budget, then re-ranked exactly.
+    /// *unfiltered* stores use the HNSW index (approximate) and re-rank the
+    /// candidate pool exactly. For `Budget::Tokens`, the pool grows until the
+    /// budget — not the pool — limits the result, so recall is never silently
+    /// capped (even with zero-token/empty memories).
     pub fn search(&self, query: &str, constraints: Query, budget: Budget) -> Result<Vec<Hit>> {
         let mut query_embeddings = self.inner.embedder.embed(&[query])?;
         let query_embedding = query_embeddings
@@ -134,69 +136,77 @@ impl MemoryStore {
             ));
         }
 
-        let candidates = self.gather_candidates(&query_embedding, &constraints, budget)?;
-        if candidates.is_empty() {
-            return Ok(Vec::new());
+        let scope = constraints.selected_scope();
+        let filters = constraints.metadata_filters();
+        let min_score = constraints.min_score_floor();
+
+        // Exact path: scoped/filtered recall (an ANN pool is global; post-filtering
+        // it under-returns) and small stores. v1.1 accelerates only unfiltered
+        // whole-store recall; per-scope indexes are a future milestone.
+        let total = self.inner.storage.len()?;
+        if scope.is_some() || !filters.is_empty() || total <= BRUTE_FORCE_THRESHOLD {
+            let candidates = self.inner.storage.candidates(scope, filters)?;
+            return Ok(self.rank_and_pack(&query_embedding, candidates, budget, min_score));
         }
 
+        // HNSW path. Start sized to the budget; for `Tokens`, grow geometrically
+        // while `pack` keeps the entire returned pool (budget not yet the limiter)
+        // and the index can still return more.
+        let grows = matches!(budget, Budget::Tokens(_));
+        let mut pool = match budget {
+            Budget::TopK(k) => k.max(HNSW_POOL_FLOOR),
+            Budget::Tokens(max) => max.max(HNSW_POOL_FLOOR),
+        };
+        loop {
+            let capped = pool.min(total);
+            let ids = self.hnsw_candidate_ids(&query_embedding, capped)?;
+            let candidates = self.inner.storage.rows(&ids)?;
+            let fetched = candidates.len();
+            let hits = self.rank_and_pack(&query_embedding, candidates, budget, min_score);
+
+            let may_have_more = fetched == capped && capped < total;
+            if !grows || hits.len() < fetched || !may_have_more {
+                return Ok(hits);
+            }
+            pool = capped.saturating_mul(2).max(capped + 1);
+        }
+    }
+
+    /// Rank candidates against the query, pack to the budget, and materialize
+    /// scored hits in ranked order.
+    fn rank_and_pack(
+        &self,
+        query_embedding: &[f32],
+        candidates: Vec<Memory>,
+        budget: Budget,
+        min_score: Option<f32>,
+    ) -> Vec<Hit> {
+        if candidates.is_empty() {
+            return Vec::new();
+        }
         let for_ranking: Vec<(MemoryId, Vec<f32>, u64)> = candidates
             .iter()
             .map(|m| (m.id, m.embedding.clone(), m.created_at))
             .collect();
-        let ranked = rank(&query_embedding, &for_ranking);
+        let ranked = rank(query_embedding, &for_ranking);
 
         let tokens: HashMap<MemoryId, usize> = candidates
             .iter()
             .map(|m| (m.id, approx_tokens(&m.content)))
             .collect();
-        let selected = pack(&ranked, &tokens, budget, constraints.min_score_floor());
+        let selected = pack(&ranked, &tokens, budget, min_score);
 
         let scores: HashMap<MemoryId, f32> = ranked.into_iter().collect();
         let mut by_id: HashMap<MemoryId, Memory> =
             candidates.into_iter().map(|m| (m.id, m)).collect();
 
-        let hits = selected
+        selected
             .into_iter()
             .filter_map(|id| {
                 let score = *scores.get(&id)?;
                 by_id.remove(&id).map(|memory| Hit { memory, score })
             })
-            .collect();
-        Ok(hits)
-    }
-
-    /// Choose the exact scan or the HNSW path and return candidate rows.
-    fn gather_candidates(
-        &self,
-        query_embedding: &[f32],
-        constraints: &Query,
-        budget: Budget,
-    ) -> Result<Vec<Memory>> {
-        let scope = constraints.selected_scope();
-        let filters = constraints.metadata_filters();
-
-        // Scoped/filtered recall must be exact: an ANN pool is global, and
-        // post-filtering a fixed pool silently under-returns. v1.1 accelerates only
-        // unfiltered whole-store recall; per-scope indexes are a future milestone.
-        if scope.is_some() || !filters.is_empty() {
-            return self.inner.storage.candidates(scope, filters);
-        }
-
-        let total = self.inner.storage.len()?;
-        if total <= BRUTE_FORCE_THRESHOLD {
-            return self.inner.storage.candidates(None, &[]);
-        }
-
-        // Size the pool to what the budget could return, so `Tokens` isn't capped.
-        // Each non-empty memory costs >= 1 token, so at most `max` memories can fit.
-        let pool = match budget {
-            Budget::TopK(k) => k.max(HNSW_POOL_FLOOR),
-            Budget::Tokens(max) => max.max(HNSW_POOL_FLOOR),
-        }
-        .min(total);
-
-        let ids = self.hnsw_candidate_ids(query_embedding, pool)?;
-        self.inner.storage.rows(&ids)
+            .collect()
     }
 
     /// Approximate nearest ids from the cached HNSW index, building it on first use.

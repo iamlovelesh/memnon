@@ -99,13 +99,21 @@ pub struct Memory {
     pub id: MemoryId,
     pub scope: Scope,
     pub content: String,
-    /// The embedding produced by the store's pinned embedder.
-    pub embedding: Vec<f32>,
+    // Not part of the public field API (read it via `embedding()`), so the
+    // internal representation can change without a breaking change.
+    pub(crate) embedding: Vec<f32>,
     pub metadata: HashMap<String, String>,
     /// Unix epoch milliseconds.
     pub created_at: u64,
     /// Unix epoch milliseconds. Equals `created_at` in v1.
     pub updated_at: u64,
+}
+
+impl Memory {
+    /// The embedding vector produced by the store's pinned embedder.
+    pub fn embedding(&self) -> &[f32] {
+        &self.embedding
+    }
 }
 
 /// A recall result: the memory plus the cosine similarity that ranked it.
