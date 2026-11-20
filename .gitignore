@@ -6,5 +6,8 @@
 # Local memnon store files created by examples/tests
 *.db
 
+# fastembed model cache (downloaded on first run)
+.fastembed_cache/
+
 # OS / editor noise
 .DS_Store

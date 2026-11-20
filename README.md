@@ -72,6 +72,27 @@ store.clear(&Scope::Session)?;   // wipe a scope (session / subagent teardown)
 - **Subagents** — `Scope::Custom("subagent:…")` + `clear(scope)` give per-subagent
   isolation and teardown. LLM-driven orchestration is v2.
 
+## Semantic embeddings (optional)
+
+The default build ships only the deterministic, **non-semantic** `HashEmbedder`
+(for tests and offline demos — it keeps the core pure-Rust and light). For real
+on-device semantic recall, enable the `fastembed` feature:
+
+```toml
+memnon = { version = "0", features = ["fastembed"] }
+```
+
+```rust
+let store = MemoryStore::open("./memory.db", memnon::FastEmbedEmbedder::new()?)?;
+```
+
+It downloads a small model (~90 MB, all-MiniLM-L6-v2) once, then runs **fully
+offline, on-device**. Try it:
+`cargo run --example semantic_quickstart --features fastembed`.
+
+(Or bring your own: implement [`Embedder`] over any model/API — see
+`examples/openai_embedder.rs`.)
+
 ## Key decisions
 
 - **Embedder required at `open`** and pinned to the file — a reopen with a
@@ -139,8 +160,8 @@ rebuilt after `delete`/`clear`. Reproduce with `cargo bench`.
 
 - **v1** — token-budgeted scored recall; scopes; exact-dedup; versioned single-file
   store; local + API embedder examples; benchmark + CI.
-- **v1.1** — ✅ from-scratch HNSW index (shipped). Next: bundled default local
-  embedder (zero-setup offline *semantic* demo), real tokenizer.
+- **v1.1** — ✅ from-scratch HNSW index + ✅ on-device semantic embedder
+  (`fastembed` feature). Next: real tokenizer.
 - **v2** — sidecar binary (REST / AG-UI) + Python/TS clients; LLM consolidation;
   subagent orchestration.
 - **Later** — graph/temporal memory; eval harness vs LongMemEval-style benchmarks.

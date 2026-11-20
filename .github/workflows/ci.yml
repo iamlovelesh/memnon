@@ -27,6 +27,18 @@ jobs:
       - name: Build examples
         run: cargo build --examples
 
+  features:
+    name: build (fastembed feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Compile-only: pulls the ONNX stack but does not download a model or run
+      # inference (that lives behind an #[ignore]d test).
+      - name: Check with fastembed
+        run: cargo check --features fastembed --all-targets
+
   coverage:
     name: coverage (report only)
     runs-on: ubuntu-latest

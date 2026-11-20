@@ -15,6 +15,11 @@ pub(crate) mod hnsw;
 pub(crate) mod index;
 pub(crate) mod storage;
 
+#[cfg(feature = "fastembed")]
+mod fastembed_embedder;
+#[cfg(feature = "fastembed")]
+pub use fastembed_embedder::FastEmbedEmbedder;
+
 pub use embedder::{Embedder, HashEmbedder};
 pub use error::{Error, Result};
 pub use query::{Budget, Query};
