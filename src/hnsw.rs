@@ -89,6 +89,8 @@ impl HnswIndex {
     /// Insert a vector. Idempotency/dedup is the store's job; this just adds a node.
     pub(crate) fn insert(&mut self, id: MemoryId, vector: Vec<f32>) {
         let level = self.random_level().min(MAX_LEVEL);
+        // Node indices are u32; the store rebuilds the index per process and caps
+        // well below 4B nodes in practice, so this cast can't realistically wrap.
         let new_idx = self.nodes.len() as u32;
         self.nodes.push(Node {
             id,
@@ -122,11 +124,7 @@ impl HnswIndex {
         for layer in (0..=start_layer).rev() {
             let candidates = self.search_layer(&query, &[ep], layer, EF_CONSTRUCTION);
             let max_degree = if layer == 0 { M0 } else { M };
-            let selected: Vec<u32> = candidates
-                .iter()
-                .take(max_degree)
-                .map(|&(_, n)| n)
-                .collect();
+            let selected = self.select_neighbors_heuristic(&candidates, max_degree);
 
             for &neighbor in &selected {
                 self.nodes[new_idx as usize].neighbors[layer].push(neighbor);
@@ -144,19 +142,53 @@ impl HnswIndex {
         }
     }
 
-    /// Keep a node's degree on a layer within `max_degree`, dropping the farthest.
+    /// Keep a node's degree on a layer within `max_degree` using the same diversity
+    /// heuristic as insertion, so a far-but-important link (e.g. to an outlier) is
+    /// not dropped merely for being the farthest.
     fn prune(&mut self, node: u32, layer: usize, max_degree: usize) {
         if self.nodes[node as usize].neighbors[layer].len() <= max_degree {
             return;
         }
         let anchor = self.nodes[node as usize].vector.clone();
-        let mut neighbors = self.nodes[node as usize].neighbors[layer].clone();
-        neighbors.sort_by(|&a, &b| {
-            self.distance(&anchor, a)
-                .total_cmp(&self.distance(&anchor, b))
-        });
-        neighbors.truncate(max_degree);
-        self.nodes[node as usize].neighbors[layer] = neighbors;
+        let mut scored: Vec<(f32, u32)> = self.nodes[node as usize].neighbors[layer]
+            .iter()
+            .map(|&n| (self.distance(&anchor, n), n))
+            .collect();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        self.nodes[node as usize].neighbors[layer] =
+            self.select_neighbors_heuristic(&scored, max_degree);
+    }
+
+    /// HNSW neighbor-selection heuristic: from `candidates` (ascending distance to
+    /// `base`), keep one only if it is closer to `base` than to every already-kept
+    /// neighbor. This retains diverse, long-range links so outlier nodes keep
+    /// in-edges and stay reachable — the naive "keep the M nearest" leaves outliers
+    /// orphaned. Pads with the nearest leftovers so degree/connectivity stays high.
+    fn select_neighbors_heuristic(&self, candidates: &[(f32, u32)], m: usize) -> Vec<u32> {
+        let mut kept: Vec<u32> = Vec::new();
+        for &(dist_to_base, cand) in candidates {
+            if kept.len() >= m {
+                break;
+            }
+            let cand_vec = &self.nodes[cand as usize].vector;
+            let diverse = kept
+                .iter()
+                .all(|&k| dist_to_base < 1.0 - cosine(cand_vec, &self.nodes[k as usize].vector));
+            if diverse {
+                kept.push(cand);
+            }
+        }
+        if kept.len() < m {
+            for &(_, cand) in candidates {
+                if kept.len() >= m {
+                    break;
+                }
+                if !kept.contains(&cand) {
+                    kept.push(cand);
+                }
+            }
+        }
+        kept
     }
 
     /// Greedy beam search on a single layer. Returns `(distance, idx)` ascending
@@ -217,7 +249,7 @@ impl HnswIndex {
         }
 
         let mut out: Vec<(f32, u32)> = best.into_iter().map(|r| (r.dist, r.idx)).collect();
-        out.sort_by(|a, b| a.0.total_cmp(&b.0));
+        out.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         out
     }
 
@@ -329,5 +361,33 @@ mod tests {
             }
         }
         assert!(hits >= 18, "recall@10 too low: {hits}/20");
+    }
+
+    #[test]
+    fn self_recall_is_near_perfect() {
+        // Querying an inserted vector should return that exact node — a direct check
+        // that nodes stay reachable (no orphaning). The diversity heuristic keeps
+        // this near-100% on a realistic spread distribution.
+        let mut rng = Xorshift::new(99);
+        let dim = 24;
+        let n = 1500usize;
+        let mut idx = HnswIndex::new();
+        let mut vectors: Vec<Vec<f32>> = Vec::new();
+        for i in 0..n {
+            let v: Vec<f32> = (0..dim).map(|_| rng.next_f64() as f32 - 0.5).collect();
+            idx.insert(mid(i as u64), v.clone());
+            vectors.push(v);
+        }
+
+        let sampled: Vec<usize> = (0..n).step_by(30).collect();
+        let found = sampled
+            .iter()
+            .filter(|&&i| idx.search(&vectors[i], 1, 64).first() == Some(&mid(i as u64)))
+            .count();
+        assert!(
+            found >= sampled.len() - 1,
+            "self-recall@1 too low: {found}/{}",
+            sampled.len()
+        );
     }
 }

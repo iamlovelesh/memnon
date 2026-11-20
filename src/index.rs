@@ -10,7 +10,9 @@ use std::collections::HashMap;
 /// Cosine similarity of two vectors, in `[-1.0, 1.0]`.
 ///
 /// Returns **`0.0`** when either vector has zero norm (e.g. the embedding of
-/// empty text) instead of dividing by zero — so `NaN` never enters a ranking.
+/// empty text) instead of dividing by zero. This guards zero-norm only; callers
+/// reject non-finite (`NaN`/`inf`) embeddings at the boundary (`MemoryStore::add`
+/// / `search`), so such values never reach here.
 pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let norm_a = a.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -24,9 +26,11 @@ pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 /// Rough token estimate: one token per ~4 Unicode scalar values, rounded up.
 ///
-/// Counts `chars()` (scalar values), not bytes, so multi-byte text (CJK, emoji)
-/// isn't wildly mis-estimated. Documented as approximate; a real tokenizer is a
-/// later milestone.
+/// This is a crude heuristic tuned for English/Latin text. It counts `chars()`
+/// (scalar values), not bytes, but real tokenizers emit roughly 1–2+ tokens *per*
+/// CJK character, so this **underestimates** token-dense scripts (CJK, etc.) by
+/// several times. `Budget::Tokens` can therefore under-count for non-Latin
+/// content — a real tokenizer is a planned milestone. Documented as approximate.
 pub(crate) fn approx_tokens(s: &str) -> usize {
     s.chars().count().div_ceil(4)
 }
@@ -44,9 +48,11 @@ pub(crate) fn rank(
         .map(|(id, embedding, created_at)| (*id, cosine(query, embedding), *created_at))
         .collect();
 
-    // Sort by score descending; break ties by created_at descending (recency).
-    // `total_cmp` gives a total order over f32 (handles any stray NaN deterministically).
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.2.cmp(&a.2)));
+    // Sort by score desc, then created_at desc (recency), then id asc as a final
+    // deterministic tiebreak so results don't depend on candidate iteration order
+    // (which differs between the brute-force and HNSW paths). `total_cmp` gives a
+    // total order over f32.
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
 
     scored
         .into_iter()
@@ -57,8 +63,14 @@ pub(crate) fn rank(
 /// Select which ranked ids to return under a budget.
 ///
 /// Drops anything below `min_score` first. For `TopK(k)`, takes the first `k`.
-/// For `Tokens(max)`, walks the ranked list and keeps each memory whose tokens
-/// still fit the running total (empty if even the top memory exceeds `max`).
+///
+/// For `Tokens(max)`, this is a **greedy fill** in ranked order: each memory is
+/// included if it still fits the running token total, and one that does *not* fit
+/// is **skipped** so a later, smaller memory can still be included (it does not
+/// stop at the first overflow). This maximizes use of the budget, at the cost of
+/// inclusion not being strictly monotonic in rank — a more-relevant large memory
+/// can be skipped while a less-relevant small one is kept. Empty if even the top
+/// eligible memory exceeds `max`.
 pub(crate) fn pack(
     ranked: &[(MemoryId, f32)],
     tokens: &HashMap<MemoryId, usize>,
@@ -139,6 +151,25 @@ mod tests {
     }
 
     #[test]
+    fn rank_tiebreak_is_deterministic_by_id() {
+        let query = vec![1.0, 0.0];
+        // Identical vectors AND created_at => tie on score and recency => id asc.
+        let candidates = vec![
+            (MemoryId::new(3), vec![1.0, 0.0], 5u64),
+            (MemoryId::new(1), vec![1.0, 0.0], 5u64),
+            (MemoryId::new(2), vec![1.0, 0.0], 5u64),
+        ];
+        let ids: Vec<_> = rank(&query, &candidates)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![MemoryId::new(1), MemoryId::new(2), MemoryId::new(3)]
+        );
+    }
+
+    #[test]
     fn pack_topk_limits_count() {
         let ranked = vec![
             (MemoryId::new(1), 0.9),
@@ -152,12 +183,25 @@ mod tests {
     }
 
     #[test]
-    fn pack_tokens_stops_at_budget() {
+    fn pack_tokens_respects_running_total() {
         let ranked = vec![(MemoryId::new(1), 0.9), (MemoryId::new(2), 0.8)];
         let tokens = HashMap::from([(MemoryId::new(1), 30usize), (MemoryId::new(2), 30usize)]);
+        // First fits (30 <= 40); second would overflow (30+30 > 40) and is dropped.
         assert_eq!(
             pack(&ranked, &tokens, Budget::Tokens(40), None),
             vec![MemoryId::new(1)]
+        );
+    }
+
+    #[test]
+    fn pack_tokens_skips_oversized_then_includes_smaller() {
+        // Greedy fill: the top-ranked item is too big and is skipped; the smaller
+        // lower-ranked item still fits and is included.
+        let ranked = vec![(MemoryId::new(1), 0.9), (MemoryId::new(2), 0.8)];
+        let tokens = HashMap::from([(MemoryId::new(1), 50usize), (MemoryId::new(2), 10usize)]);
+        assert_eq!(
+            pack(&ranked, &tokens, Budget::Tokens(40), None),
+            vec![MemoryId::new(2)]
         );
     }
 

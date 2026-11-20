@@ -10,16 +10,14 @@ use crate::storage::{MemoryInput, Storage};
 use crate::types::{Entry, Hit, Memory, MemoryId, Scope};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// At or below this many memories, search scans exhaustively (exact and fast
-/// enough that an ANN index isn't worth it). Above it, the HNSW index is used.
+/// enough that an ANN index isn't worth it). Above it, unfiltered recall uses HNSW.
 const BRUTE_FORCE_THRESHOLD: usize = 2000;
 /// Minimum HNSW candidate pool, so small budgets still re-rank a healthy set.
 const HNSW_POOL_FLOOR: usize = 128;
-/// Extra over-fetch factor when a metadata filter may discard candidates.
-const FILTER_OVERFETCH: usize = 4;
 
 /// A handle to a memory store backed by a single embedded file.
 ///
@@ -32,8 +30,8 @@ pub struct MemoryStore {
 struct Inner {
     storage: Storage,
     embedder: Arc<dyn Embedder>,
-    /// Lazily built, cached HNSW index; dropped (invalidated) on any write and
-    /// rebuilt on the next search that needs it.
+    /// Cached HNSW index: lazily built, incrementally extended on `add`, and
+    /// dropped (rebuilt on next use) on `delete`/`clear`.
     index: RwLock<Option<HnswIndex>>,
 }
 
@@ -59,8 +57,9 @@ impl MemoryStore {
         })
     }
 
-    /// Append memories to `scope` (see the type docs). One transaction, 1:1 ids,
-    /// exact-dedup; empty input is a no-op.
+    /// Append memories to `scope`. One transaction, 1:1 ids, exact-dedup; empty
+    /// input is a no-op. Embeddings must be finite and match the embedder's
+    /// dimension, else [`Error::Embed`] / [`Error::DimensionMismatch`].
     pub fn add<I, E>(&self, items: I, scope: Scope) -> Result<Vec<MemoryId>>
     where
         I: IntoIterator<Item = E>,
@@ -91,25 +90,49 @@ impl MemoryStore {
                     found: embedding.len(),
                 });
             }
+            if !is_finite(&embedding) {
+                return Err(Error::Embed(
+                    "embedder returned a non-finite (NaN/inf) value".into(),
+                ));
+            }
             let (content, metadata) = entry.into_parts();
             inputs.push((scope.clone(), content, metadata, embedding, created_at));
         }
 
-        let ids = self.inner.storage.insert_batch(&inputs)?;
-        self.invalidate_index();
-        Ok(ids)
+        let inserted = self.inner.storage.insert_batch(&inputs)?;
+
+        // Keep a built index in sync incrementally (avoids an O(n) rebuild per add);
+        // if none is built, the next search builds it from storage, new rows included.
+        {
+            let mut guard = self.index_write();
+            if let Some(index) = guard.as_mut() {
+                for ((id, is_new), input) in inserted.iter().zip(&inputs) {
+                    if *is_new {
+                        index.insert(*id, input.3.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(inserted.into_iter().map(|(id, _)| id).collect())
     }
 
     /// Recall memories for `query` under `constraints`, limited by `budget`,
     /// returning scored [`Hit`]s most-relevant first.
     ///
-    /// Small or filtered stores are searched exactly; large stores use the HNSW
-    /// index (approximate) and re-rank the candidate pool exactly.
+    /// Scoped/filtered queries and small stores are searched exactly. Large
+    /// *unfiltered* stores use the HNSW index (approximate) with the candidate pool
+    /// sized to the budget, then re-ranked exactly.
     pub fn search(&self, query: &str, constraints: Query, budget: Budget) -> Result<Vec<Hit>> {
         let mut query_embeddings = self.inner.embedder.embed(&[query])?;
         let query_embedding = query_embeddings
             .pop()
             .ok_or_else(|| Error::Embed("embedder returned no vector for the query".into()))?;
+        if !is_finite(&query_embedding) {
+            return Err(Error::Embed(
+                "embedder returned a non-finite (NaN/inf) query vector".into(),
+            ));
+        }
 
         let candidates = self.gather_candidates(&query_embedding, &constraints, budget)?;
         if candidates.is_empty() {
@@ -142,7 +165,7 @@ impl MemoryStore {
         Ok(hits)
     }
 
-    /// Choose the exact scan or the HNSW path, returning filtered candidate rows.
+    /// Choose the exact scan or the HNSW path and return candidate rows.
     fn gather_candidates(
         &self,
         query_embedding: &[f32],
@@ -152,47 +175,49 @@ impl MemoryStore {
         let scope = constraints.selected_scope();
         let filters = constraints.metadata_filters();
 
-        if self.inner.storage.len()? <= BRUTE_FORCE_THRESHOLD {
+        // Scoped/filtered recall must be exact: an ANN pool is global, and
+        // post-filtering a fixed pool silently under-returns. v1.1 accelerates only
+        // unfiltered whole-store recall; per-scope indexes are a future milestone.
+        if scope.is_some() || !filters.is_empty() {
             return self.inner.storage.candidates(scope, filters);
         }
 
-        // HNSW path: over-fetch a candidate pool, fetch rows, filter, re-rank later.
-        let base = match budget {
-            Budget::TopK(k) => k,
-            Budget::Tokens(_) => HNSW_POOL_FLOOR,
-        };
-        let overfetch = if filters.is_empty() {
-            1
-        } else {
-            FILTER_OVERFETCH
-        };
-        let pool = base.max(HNSW_POOL_FLOOR) * overfetch;
+        let total = self.inner.storage.len()?;
+        if total <= BRUTE_FORCE_THRESHOLD {
+            return self.inner.storage.candidates(None, &[]);
+        }
+
+        // Size the pool to what the budget could return, so `Tokens` isn't capped.
+        // Each non-empty memory costs >= 1 token, so at most `max` memories can fit.
+        let pool = match budget {
+            Budget::TopK(k) => k.max(HNSW_POOL_FLOOR),
+            Budget::Tokens(max) => max.max(HNSW_POOL_FLOOR),
+        }
+        .min(total);
 
         let ids = self.hnsw_candidate_ids(query_embedding, pool)?;
-        let filtered: Vec<Memory> = self
-            .inner
-            .storage
-            .rows(&ids)?
-            .into_iter()
-            .filter(|m| candidate_matches(m, scope, filters))
-            .collect();
-
-        // Safety net: if the approximate pool left nothing after filtering, fall
-        // back to an exact scan so we never silently under-return.
-        if filtered.is_empty() {
-            return self.inner.storage.candidates(scope, filters);
-        }
-        Ok(filtered)
+        self.inner.storage.rows(&ids)
     }
 
-    /// Approximate nearest ids from the (lazily built) HNSW index.
+    /// Approximate nearest ids from the cached HNSW index, building it on first use.
     fn hnsw_candidate_ids(&self, query_embedding: &[f32], pool: usize) -> Result<Vec<MemoryId>> {
-        let mut guard = self.inner.index.write().unwrap();
+        let ef = (pool * 2).max(64);
+        // Fast path: index already built — a shared read lock allows concurrent searches.
+        {
+            let guard = self.inner.index.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(index) = guard.as_ref() {
+                return Ok(index.search(query_embedding, pool, ef));
+            }
+        }
+        // Build under the write lock (double-checked in case another thread raced).
+        let mut guard = self.index_write();
         if guard.is_none() {
             *guard = Some(self.build_index()?);
         }
-        let index = guard.as_ref().expect("index just built");
-        Ok(index.search(query_embedding, pool, (pool * 2).max(64)))
+        Ok(guard
+            .as_ref()
+            .expect("index present")
+            .search(query_embedding, pool, ef))
     }
 
     /// Build an HNSW index over every stored memory.
@@ -205,8 +230,14 @@ impl MemoryStore {
         Ok(index)
     }
 
+    /// Write guard on the index, recovering from a poisoned lock rather than
+    /// panicking — one transient failure shouldn't permanently brick the store.
+    fn index_write(&self) -> RwLockWriteGuard<'_, Option<HnswIndex>> {
+        self.inner.index.write().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn invalidate_index(&self) {
-        *self.inner.index.write().unwrap() = None;
+        *self.index_write() = None;
     }
 
     /// Fetch a single memory by id.
@@ -248,12 +279,8 @@ impl MemoryStore {
     }
 }
 
-/// Whether a memory passes a scope + metadata-equality filter.
-fn candidate_matches(memory: &Memory, scope: Option<&Scope>, filters: &[(String, String)]) -> bool {
-    scope.is_none_or(|s| &memory.scope == s)
-        && filters
-            .iter()
-            .all(|(k, v)| memory.metadata.get(k).map(String::as_str) == Some(v.as_str()))
+fn is_finite(v: &[f32]) -> bool {
+    v.iter().all(|x| x.is_finite())
 }
 
 /// Current Unix time in milliseconds (0 if the clock is before the epoch).

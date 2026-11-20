@@ -106,9 +106,11 @@ impl Storage {
     }
 
     /// Append a batch of memories in a single transaction. Exact `(scope, content)`
-    /// duplicates return the existing id instead of inserting. Returned ids are
-    /// 1:1 with `items`.
-    pub(crate) fn insert_batch(&self, items: &[MemoryInput]) -> Result<Vec<MemoryId>> {
+    /// duplicates return the existing id instead of inserting.
+    ///
+    /// Returns `(id, is_new)` 1:1 with `items`: `is_new` is `false` when the item
+    /// matched an existing row (so callers can keep an index in sync incrementally).
+    pub(crate) fn insert_batch(&self, items: &[MemoryInput]) -> Result<Vec<(MemoryId, bool)>> {
         let wtxn = self.db.begin_write().map_err(io)?;
         let mut ids = Vec::with_capacity(items.len());
         {
@@ -126,7 +128,7 @@ impl Storage {
             for (scope, content, metadata, embedding, created_at) in items {
                 let dkey = dedup_key(scope, content);
                 if let Some(found) = dedup.get(dkey.as_str()).map_err(io)? {
-                    ids.push(MemoryId::new(found.value()));
+                    ids.push((MemoryId::new(found.value()), false));
                     continue;
                 }
                 let id = next;
@@ -144,7 +146,7 @@ impl Storage {
                     .insert(id, encode_record(&mem)?.as_slice())
                     .map_err(io)?;
                 dedup.insert(dkey.as_str(), id).map_err(io)?;
-                ids.push(MemoryId::new(id));
+                ids.push((MemoryId::new(id), true));
             }
             meta.insert(KEY_NEXT_ID, next.to_le_bytes().as_slice())
                 .map_err(io)?;
@@ -375,12 +377,17 @@ mod tests {
         )
     }
 
+    fn only_ids(inserted: Vec<(MemoryId, bool)>) -> Vec<MemoryId> {
+        inserted.into_iter().map(|(id, _)| id).collect()
+    }
+
     #[test]
     fn insert_then_get_roundtrips() {
         let (_d, s) = temp_store();
-        let ids = s
-            .insert_batch(&[item(Scope::LongTerm, "hello", vec![1.0, 2.0], 7)])
-            .unwrap();
+        let ids = only_ids(
+            s.insert_batch(&[item(Scope::LongTerm, "hello", vec![1.0, 2.0], 7)])
+                .unwrap(),
+        );
         let got = s.get(ids[0]).unwrap().unwrap();
         assert_eq!(got.content, "hello");
         assert_eq!(got.embedding, vec![1.0, 2.0]);
@@ -396,16 +403,19 @@ mod tests {
         let path = dir.path().join("m.db");
         let first = {
             let s = Storage::open(&path).unwrap();
-            s.insert_batch(&[
-                item(Scope::Session, "a", vec![1.0], 1),
-                item(Scope::Session, "b", vec![1.0], 1),
-            ])
-            .unwrap()
+            only_ids(
+                s.insert_batch(&[
+                    item(Scope::Session, "a", vec![1.0], 1),
+                    item(Scope::Session, "b", vec![1.0], 1),
+                ])
+                .unwrap(),
+            )
         };
         let s = Storage::open(&path).unwrap();
-        let more = s
-            .insert_batch(&[item(Scope::Session, "c", vec![1.0], 1)])
-            .unwrap();
+        let more = only_ids(
+            s.insert_batch(&[item(Scope::Session, "c", vec![1.0], 1)])
+                .unwrap(),
+        );
         assert_ne!(first[0], first[1]);
         assert_ne!(more[0], first[0]);
         assert_ne!(more[0], first[1]);
@@ -415,13 +425,30 @@ mod tests {
     #[test]
     fn exact_duplicate_returns_same_id_without_second_row() {
         let (_d, s) = temp_store();
-        let a = s
-            .insert_batch(&[item(Scope::LongTerm, "dup", vec![1.0], 1)])
-            .unwrap();
-        let b = s
-            .insert_batch(&[item(Scope::LongTerm, "dup", vec![1.0], 2)])
-            .unwrap();
+        let a = only_ids(
+            s.insert_batch(&[item(Scope::LongTerm, "dup", vec![1.0], 1)])
+                .unwrap(),
+        );
+        let b = only_ids(
+            s.insert_batch(&[item(Scope::LongTerm, "dup", vec![1.0], 2)])
+                .unwrap(),
+        );
         assert_eq!(a[0], b[0]);
+        assert_eq!(s.count(&Scope::LongTerm).unwrap(), 1);
+    }
+
+    #[test]
+    fn intra_batch_duplicate_reuses_id_and_marks_not_new() {
+        let (_d, s) = temp_store();
+        let inserted = s
+            .insert_batch(&[
+                item(Scope::LongTerm, "same", vec![1.0], 1),
+                item(Scope::LongTerm, "same", vec![1.0], 2),
+            ])
+            .unwrap();
+        assert_eq!(inserted[0].0, inserted[1].0); // same id
+        assert!(inserted[0].1, "first occurrence is new");
+        assert!(!inserted[1].1, "second occurrence is a dedup hit");
         assert_eq!(s.count(&Scope::LongTerm).unwrap(), 1);
     }
 
@@ -503,16 +530,18 @@ mod tests {
     #[test]
     fn delete_removes_row_and_clears_dedup() {
         let (_d, s) = temp_store();
-        let ids = s
-            .insert_batch(&[item(Scope::LongTerm, "x", vec![1.0], 1)])
-            .unwrap();
+        let ids = only_ids(
+            s.insert_batch(&[item(Scope::LongTerm, "x", vec![1.0], 1)])
+                .unwrap(),
+        );
         assert!(s.delete(ids[0]).unwrap());
         assert!(s.get(ids[0]).unwrap().is_none());
         assert!(!s.delete(ids[0]).unwrap());
         // dedup cleared: re-adding the same content yields a NEW id.
-        let again = s
-            .insert_batch(&[item(Scope::LongTerm, "x", vec![1.0], 1)])
-            .unwrap();
+        let again = only_ids(
+            s.insert_batch(&[item(Scope::LongTerm, "x", vec![1.0], 1)])
+                .unwrap(),
+        );
         assert_ne!(again[0], ids[0]);
     }
 

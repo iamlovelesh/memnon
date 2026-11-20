@@ -245,7 +245,7 @@ fn large_store_uses_hnsw_and_finds_exact_match() {
     // Exceed the brute-force threshold (2000) to exercise the HNSW path.
     // Topics give the vectors a gradient so the target sits in a reachable
     // cluster (an isolated outlier is a known-hard ANN case, out of scope here).
-    let bulk: Vec<String> = (0..2500)
+    let bulk: Vec<String> = (0..2100)
         .map(|i| format!("filler memory {i} about topic {}", i % 50))
         .collect();
     let refs: Vec<&str> = bulk.iter().map(String::as_str).collect();
@@ -260,9 +260,11 @@ fn large_store_uses_hnsw_and_finds_exact_match() {
 }
 
 #[test]
-fn large_store_respects_metadata_filter_via_hnsw() {
+fn large_store_metadata_filter_is_exact() {
+    // Filtered recall takes the exact-scan path even above the threshold, so it
+    // never under-returns the way a post-filtered ANN pool would.
     let (_d, s) = store();
-    let bulk: Vec<Entry> = (0..2500).map(|i| Entry::new(format!("doc {i}"))).collect();
+    let bulk: Vec<Entry> = (0..2100).map(|i| Entry::new(format!("doc {i}"))).collect();
     s.add(bulk, Scope::LongTerm).unwrap();
     s.add(
         [Entry::new("special tagged memory").meta("tag", "keep")],
@@ -282,6 +284,140 @@ fn large_store_respects_metadata_filter_via_hnsw() {
 }
 
 #[test]
+fn large_store_scoped_query_returns_all_in_scope() {
+    // Regression for the HNSW under-return bug: a scoped query on a large,
+    // mixed-scope store must return ALL in-scope matches, not a truncated pool.
+    let (_d, s) = store();
+    let session: Vec<String> = (0..2100).map(|i| format!("session doc {i}")).collect();
+    s.add(
+        session.iter().map(String::as_str).collect::<Vec<_>>(),
+        Scope::Session,
+    )
+    .unwrap();
+    let longterm: Vec<String> = (0..40).map(|i| format!("longterm fact {i}")).collect();
+    s.add(
+        longterm.iter().map(String::as_str).collect::<Vec<_>>(),
+        Scope::LongTerm,
+    )
+    .unwrap();
+
+    let hits = s
+        .search(
+            "longterm fact 5",
+            Query::new().scope(Scope::LongTerm),
+            Budget::TopK(40),
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 40, "scoped query under-returned");
+    assert!(hits.iter().all(|h| h.memory.scope == Scope::LongTerm));
+}
+
+#[test]
+fn large_store_tokens_budget_is_not_capped() {
+    // Regression: a large token budget on a large store must not be silently
+    // capped at the HNSW pool floor (128).
+    let (_d, s) = store();
+    // Navigable content (shared tokens form a gradient) so HNSW can reach the store.
+    let items: Vec<String> = (0..2200)
+        .map(|i| format!("note {i} cluster {} band {}", i % 20, i % 7))
+        .collect();
+    s.add(
+        items.iter().map(String::as_str).collect::<Vec<_>>(),
+        Scope::LongTerm,
+    )
+    .unwrap();
+
+    let hits = s
+        .search(
+            "note 100 cluster 0 band 2",
+            Query::new(),
+            Budget::Tokens(1_000_000),
+        )
+        .unwrap();
+    assert!(
+        hits.len() > 1000,
+        "Tokens budget silently capped: {} hits",
+        hits.len()
+    );
+}
+
+#[test]
+fn hnsw_path_top_k_tracks_brute_force() {
+    // Equivalence guard: on a large unfiltered store, the HNSW path's top-k should
+    // closely track a brute-force cosine ranking (computed here from the stored
+    // embeddings), and reproduce the exact match at #1.
+    let (_d, s) = store();
+    let embedder = HashEmbedder::new(64);
+    let items: Vec<String> = (0..2200)
+        .map(|i| format!("doc number {i} topic {} sub {}", i % 37, i % 11))
+        .collect();
+    s.add(
+        items.iter().map(String::as_str).collect::<Vec<_>>(),
+        Scope::LongTerm,
+    )
+    .unwrap();
+
+    // Item 1234 verbatim: 1234 % 37 = 13, 1234 % 11 = 2.
+    let query = "doc number 1234 topic 13 sub 2";
+    let q = embedder.embed(&[query]).unwrap().pop().unwrap();
+
+    let cos = |a: &[f32], b: &[f32]| -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if na == 0.0 || nb == 0.0 {
+            0.0
+        } else {
+            dot / (na * nb)
+        }
+    };
+    let all = s.get_all(Scope::LongTerm).unwrap();
+    let mut scored: Vec<(f32, &str)> = all
+        .iter()
+        .map(|m| (cos(&q, &m.embedding), m.content.as_str()))
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let brute_top: Vec<&str> = scored.iter().take(10).map(|(_, c)| *c).collect();
+
+    let hits = s.search(query, Query::new(), Budget::TopK(10)).unwrap();
+    assert_eq!(hits[0].memory.content, query); // exact match ranks #1
+    let overlap = hits
+        .iter()
+        .filter(|h| brute_top.contains(&h.memory.content.as_str()))
+        .count();
+    assert!(
+        overlap >= 7,
+        "HNSW/brute top-10 overlap too low: {overlap}/10"
+    );
+}
+
+#[test]
+fn concurrent_add_and_search_do_not_deadlock() {
+    let (_d, s) = store();
+    let seed: Vec<String> = (0..100).map(|i| format!("seed {i}")).collect();
+    s.add(
+        seed.iter().map(String::as_str).collect::<Vec<_>>(),
+        Scope::LongTerm,
+    )
+    .unwrap();
+
+    let mut handles = Vec::new();
+    for t in 0..4 {
+        let s = s.clone();
+        handles.push(thread::spawn(move || {
+            for i in 0..50 {
+                s.add([format!("w{t}-{i}")], Scope::LongTerm).unwrap();
+                let _ = s.search("seed 1", Query::new(), Budget::TopK(3)).unwrap();
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert!(s.count(&Scope::LongTerm).unwrap() >= 100);
+}
+
+#[test]
 fn add_rejects_embedding_with_wrong_dimension() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.db");
@@ -293,5 +429,33 @@ fn add_rejects_embedding_with_wrong_dimension() {
             expected: 4,
             found: 3
         })
+    ));
+}
+
+/// An embedder that returns a `NaN` component, to exercise the finiteness guard.
+struct NanEmbedder;
+impl Embedder for NanEmbedder {
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        Ok(texts
+            .iter()
+            .map(|_| vec![f32::NAN, 0.0, 0.0, 0.0])
+            .collect())
+    }
+    fn dimensions(&self) -> usize {
+        4
+    }
+    fn identity(&self) -> &str {
+        "nan-v1"
+    }
+}
+
+#[test]
+fn add_rejects_non_finite_embedding() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.db");
+    let s = MemoryStore::open(&path, NanEmbedder).unwrap();
+    assert!(matches!(
+        s.add(["x"], Scope::LongTerm),
+        Err(Error::Embed(_))
     ));
 }

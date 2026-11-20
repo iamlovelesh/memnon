@@ -79,8 +79,9 @@ store.clear(&Scope::Session)?;   // wipe a scope (session / subagent teardown)
 - **Versioned on-disk format** — files written by v1 stay readable by v1.x.
 - **Scored results** (`Hit { memory, score }`) and an optional `min_score` floor.
 - **Transactional, append-only writes** with exact-duplicate dedup.
-- **Exact scan under ~2k memories; from-scratch HNSW index above** (approximate,
-  then re-ranked exactly).
+- **Exact scan under ~2k memories and for all scoped/filtered queries;
+  from-scratch HNSW index for large unfiltered recall** (approximate, re-ranked
+  exactly).
 - `MemoryStore` is `Clone + Send + Sync`.
 
 Full rationale, non-goals, and approaches:
@@ -115,9 +116,11 @@ memnon isn't a vector DB and isn't trying to beat Mem0 on features — it owns t
 | 50,000 | ~50 ms | **~0.5 ms** |
 
 Brute force is linear (~1 ms per 1k memories); HNSW is ~logarithmic, keeping
-recall sub-millisecond as the store grows. HNSW recall is **approximate**
-(tunable via `ef`) and re-ranked exactly; the first search after a write pays a
-one-time O(n log n) index build. Reproduce with `cargo bench`.
+recall sub-millisecond as the store grows. **Scoped and metadata-filtered queries
+use the exact scan** (correctness over speed) — HNSW accelerates *unfiltered*
+whole-store recall, where it's approximate (tunable via `ef`) and re-ranked
+exactly. The index is built on first use, **extended incrementally on `add`**, and
+rebuilt after `delete`/`clear`. Reproduce with `cargo bench`.
 
 ## Honest scope & limitations (read before adopting)
 

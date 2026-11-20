@@ -9,7 +9,7 @@ use std::fmt;
 /// Opaque identifier for a stored memory. The inner value is private (minted only
 /// inside the crate) so callers can't forge ids, and so a future switch to
 /// content-hash ids isn't a breaking change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct MemoryId(u64);
 
 impl MemoryId {
@@ -93,6 +93,7 @@ pub enum Scope {
 }
 
 /// A stored memory. `updated_at == created_at` in v1 (append-only).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Memory {
     pub id: MemoryId,
@@ -108,6 +109,7 @@ pub struct Memory {
 }
 
 /// A recall result: the memory plus the cosine similarity that ranked it.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct Hit {
     pub memory: Memory,
