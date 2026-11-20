@@ -11,6 +11,7 @@ pub mod query;
 pub mod store;
 pub mod types;
 
+pub(crate) mod hnsw;
 pub(crate) mod index;
 pub(crate) mod storage;
 
