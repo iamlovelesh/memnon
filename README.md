@@ -79,7 +79,8 @@ store.clear(&Scope::Session)?;   // wipe a scope (session / subagent teardown)
 - **Versioned on-disk format** — files written by v1 stay readable by v1.x.
 - **Scored results** (`Hit { memory, score }`) and an optional `min_score` floor.
 - **Transactional, append-only writes** with exact-duplicate dedup.
-- **Exact brute-force cosine** recall in v1; HNSW is the first post-v1 milestone.
+- **Exact scan under ~2k memories; from-scratch HNSW index above** (approximate,
+  then re-ranked exactly).
 - `MemoryStore` is `Clone + Send + Sync`.
 
 Full rationale, non-goals, and approaches:
@@ -95,7 +96,7 @@ Build plan: [`docs/plans/2026-11-18-memnon-v1-implementation-plan.md`](docs/plan
 | Memory semantics (scopes, recall API) | ✅ | ✅ | ❌ (you build it) |
 | **Token-budget-first recall** | ✅ | ❌ | ❌ |
 | LLM conflict resolution | ⏳ v2 | ✅ | ❌ |
-| ANN index at scale | ⏳ v1.1 (HNSW) | ✅ | ✅ |
+| ANN index at scale | ✅ HNSW (approximate) | ✅ | ✅ |
 | Language reach | Rust (sidecar → any, v2) | Python-first | Rust / SQL |
 
 memnon isn't a vector DB and isn't trying to beat Mem0 on features — it owns the
@@ -103,18 +104,20 @@ memnon isn't a vector DB and isn't trying to beat Mem0 on features — it owns t
 
 ## Benchmarks
 
-Exact brute-force cosine, 384-dim vectors, `Budget::Tokens(2000)`, `cargo bench`
-on a developer laptop (indicative, not a datacenter number):
+384-dim vectors, `Budget::Tokens(2000)`, `cargo bench` on a developer laptop
+(indicative). memnon auto-switches from the exact scan to the HNSW index above
+~2000 memories:
 
-| Memories in scope | Search latency |
-|---|---|
-| 1,000 | ~0.8 ms |
-| 10,000 | ~9 ms |
-| 50,000 | ~50 ms |
+| Memories | Exact scan (v1) | HNSW (v1.1) |
+|---|---|---|
+| 1,000 | ~0.8 ms | ~0.8 ms (scan) |
+| 10,000 | ~9 ms | **~1 ms** |
+| 50,000 | ~50 ms | **~0.5 ms** |
 
-Latency scales linearly (~1 ms per 1k memories), so v1 is comfortable to roughly
-**50k memories per scope** and crosses ~100 ms near ~100k — which is where the
-v1.1 HNSW index earns its place. Reproduce with `cargo bench`.
+Brute force is linear (~1 ms per 1k memories); HNSW is ~logarithmic, keeping
+recall sub-millisecond as the store grows. HNSW recall is **approximate**
+(tunable via `ef`) and re-ranked exactly; the first search after a write pays a
+one-time O(n log n) index build. Reproduce with `cargo bench`.
 
 ## Honest scope & limitations (read before adopting)
 
@@ -133,8 +136,8 @@ v1.1 HNSW index earns its place. Reproduce with `cargo bench`.
 
 - **v1** — token-budgeted scored recall; scopes; exact-dedup; versioned single-file
   store; local + API embedder examples; benchmark + CI.
-- **v1.1** — HNSW index; bundled default local embedder (zero-setup offline demo);
-  real tokenizer.
+- **v1.1** — ✅ from-scratch HNSW index (shipped). Next: bundled default local
+  embedder (zero-setup offline *semantic* demo), real tokenizer.
 - **v2** — sidecar binary (REST / AG-UI) + Python/TS clients; LLM consolidation;
   subagent orchestration.
 - **Later** — graph/temporal memory; eval harness vs LongMemEval-style benchmarks.
