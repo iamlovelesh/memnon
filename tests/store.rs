@@ -240,6 +240,48 @@ impl Embedder for LyingEmbedder {
 }
 
 #[test]
+fn large_store_uses_hnsw_and_finds_exact_match() {
+    let (_d, s) = store();
+    // Exceed the brute-force threshold (2000) to exercise the HNSW path.
+    // Topics give the vectors a gradient so the target sits in a reachable
+    // cluster (an isolated outlier is a known-hard ANN case, out of scope here).
+    let bulk: Vec<String> = (0..2500)
+        .map(|i| format!("filler memory {i} about topic {}", i % 50))
+        .collect();
+    let refs: Vec<&str> = bulk.iter().map(String::as_str).collect();
+    s.add(refs, Scope::LongTerm).unwrap();
+
+    // Query a real memory verbatim: its same-topic siblings make it reachable,
+    // and the exact match (cosine 1.0) ranks first after the exact re-rank.
+    let target = "filler memory 1234 about topic 34";
+    let hits = s.search(target, Query::new(), Budget::TopK(3)).unwrap();
+    assert!(!hits.is_empty());
+    assert_eq!(hits[0].memory.content, target);
+}
+
+#[test]
+fn large_store_respects_metadata_filter_via_hnsw() {
+    let (_d, s) = store();
+    let bulk: Vec<Entry> = (0..2500).map(|i| Entry::new(format!("doc {i}"))).collect();
+    s.add(bulk, Scope::LongTerm).unwrap();
+    s.add(
+        [Entry::new("special tagged memory").meta("tag", "keep")],
+        Scope::LongTerm,
+    )
+    .unwrap();
+
+    let hits = s
+        .search(
+            "special tagged memory",
+            Query::new().filter("tag", "keep"),
+            Budget::TopK(5),
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].memory.content, "special tagged memory");
+}
+
+#[test]
 fn add_rejects_embedding_with_wrong_dimension() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.db");

@@ -5,7 +5,7 @@
 
 use crate::error::{Error, Result};
 use crate::types::{Memory, MemoryId, Scope};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -262,6 +262,26 @@ impl Storage {
     /// Number of memories in a scope.
     pub(crate) fn count(&self, scope: &Scope) -> Result<usize> {
         Ok(self.get_all(scope)?.len())
+    }
+
+    /// Total number of memories across all scopes (cheap — a table length).
+    pub(crate) fn len(&self) -> Result<usize> {
+        let rtxn = self.db.begin_read().map_err(io)?;
+        let memories = rtxn.open_table(MEMORIES).map_err(io)?;
+        Ok(memories.len().map_err(io)? as usize)
+    }
+
+    /// Full rows for a set of ids, skipping any that are gone.
+    pub(crate) fn rows(&self, ids: &[MemoryId]) -> Result<Vec<Memory>> {
+        let rtxn = self.db.begin_read().map_err(io)?;
+        let memories = rtxn.open_table(MEMORIES).map_err(io)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(v) = memories.get(id.raw()).map_err(io)? {
+                out.push(decode_record(v.value())?);
+            }
+        }
+        Ok(out)
     }
 
     /// All distinct scopes currently present.
