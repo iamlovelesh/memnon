@@ -16,6 +16,7 @@ bincode = "1"
 fastembed = { version = "7.7.1", optional = true }
 redb = "5.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
+tiktoken-rs = { version = "0.12.1", optional = true }
 
 [dev-dependencies]
 criterion = "0.8.2"
@@ -35,3 +36,5 @@ required-features = ["fastembed"]
 # Optional on-device semantic embedder (ONNX via fastembed). Pulls heavy native
 # deps, so it's off by default: `cargo add memnon --features fastembed`.
 fastembed = ["dep:fastembed"]
+# Optional OpenAI-compatible BPE tokenizer (tiktoken-rs), off by default.
+tiktoken = ["dep:tiktoken-rs"]

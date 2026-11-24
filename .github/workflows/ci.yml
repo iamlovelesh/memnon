@@ -28,7 +28,7 @@ jobs:
         run: cargo build --examples
 
   features:
-    name: lint (fastembed feature)
+    name: lint (fastembed, tiktoken features)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,6 +41,8 @@ jobs:
       # run it manually with `--features fastembed -- --ignored`).
       - name: Clippy with fastembed
         run: cargo clippy --features fastembed --all-targets -- -D warnings
+      - name: Clippy with tiktoken
+        run: cargo clippy --features tiktoken --all-targets -- -D warnings
 
   coverage:
     name: coverage (report only)

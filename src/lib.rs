@@ -21,6 +21,11 @@ mod fastembed_embedder;
 #[cfg(feature = "fastembed")]
 pub use fastembed_embedder::FastEmbedEmbedder;
 
+#[cfg(feature = "tiktoken")]
+mod tiktoken_tokenizer;
+#[cfg(feature = "tiktoken")]
+pub use tiktoken_tokenizer::TiktokenTokenizer;
+
 pub use embedder::{Embedder, HashEmbedder};
 pub use error::{Error, Result};
 pub use query::{Budget, Query};
