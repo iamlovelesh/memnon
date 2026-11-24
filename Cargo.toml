@@ -8,6 +8,7 @@ repository = "https://github.com/iamlovelesh/memnon"
 keywords = ["ai", "agents", "memory", "embeddings", "local-first"]
 categories = ["database-implementations", "science"]
 readme = "README.md"
+exclude = ["/tests/fixtures", "/docs", "/.github", "/.superpowers"]
 
 # Core deps are pure-Rust and light. The only native/heavy dependency,
 # `fastembed` (ONNX), is optional and behind the `fastembed` feature.

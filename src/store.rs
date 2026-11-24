@@ -49,6 +49,8 @@ impl MemoryStore {
 
     /// Like [`Self::open`], but with an explicit [`Tokenizer`] for token-budget
     /// counting (e.g. a model-specific tokenizer instead of the built-in heuristic).
+    /// Also performs the embedder-identity pin, same as `open`: a reopen with a
+    /// mismatched embedder returns [`Error::EmbedderMismatch`].
     pub fn open_with_tokenizer<E: Embedder + 'static, T: Tokenizer + 'static>(
         path: impl AsRef<Path>,
         embedder: E,

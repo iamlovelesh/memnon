@@ -11,8 +11,10 @@ fn from_bytes_loads_and_counts() {
 #[test]
 fn cjk_counts_more_than_heuristic() {
     let t = HfTokenizer::from_bytes(FIXTURE).unwrap();
-    let text = "日本語のテキストです";
-    assert!(t.count_tokens(text) > text.chars().count().div_ceil(4));
+    // Repeated to give the real-tokenizer count a comfortable margin over the
+    // `chars/4` heuristic, so the assertion stays robust to fixture changes.
+    let text = "日本語のテキストです".repeat(5);
+    assert!(t.count_tokens(&text) > text.chars().count().div_ceil(4));
 }
 #[test]
 fn malformed_bytes_error() {
