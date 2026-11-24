@@ -98,6 +98,52 @@ offline, on-device**. Try it:
 (Or bring your own: implement [`Embedder`] over any model/API — see
 `examples/openai_embedder.rs`.)
 
+## Real tokenizers (optional)
+
+`Budget::Tokens` needs a token *count*, not just a text length, to pack a
+context window accurately. The default build ships only `HeuristicTokenizer`
+(~1 token per 4 characters — fast, zero deps, but approximate, especially for
+non-Latin scripts). For exact counts, plug in a real tokenizer via
+[`Tokenizer`] and `MemoryStore::open_with_tokenizer`:
+
+```toml
+memnon = { version = "0", features = ["tiktoken"] }       # OpenAI BPE
+# or
+memnon = { version = "0", features = ["hf-tokenizer"] }   # any local tokenizer.json
+# or
+memnon = { version = "0", features = ["hf-hub"] }         # hf-tokenizer + fetch-by-model-id
+```
+
+```rust
+// tiktoken: exact counts for OpenAI models (o200k_base by default).
+use memnon::{MemoryStore, TiktokenTokenizer};
+let store = MemoryStore::open_with_tokenizer(
+    "./memory.db", embedder, TiktokenTokenizer::new(),
+)?;
+// or pin to a specific model's encoding:
+let tok = TiktokenTokenizer::with_model("gpt-4o")?;
+```
+
+```rust
+// HuggingFace: any model that ships a tokenizer.json (BERT, Llama, Mistral, ...).
+use memnon::{MemoryStore, HfTokenizer};
+let tok = HfTokenizer::from_file("./tokenizer.json")?;
+// or, behind `hf-hub`, fetch by model id (downloads once, then cached offline):
+let tok = HfTokenizer::from_pretrained("bert-base-uncased")?;
+let store = MemoryStore::open_with_tokenizer("./memory.db", embedder, tok)?;
+```
+
+Don't have either? Implement [`Tokenizer`] yourself — it's one method,
+`count_tokens(&self, text: &str) -> usize` — and pass it to
+`open_with_tokenizer`. See `examples/custom_tokenizer.rs`.
+
+> **Match your generation LLM, not your embedding model.** `Budget::Tokens` is
+> about fitting memories into the **prompt you send to the LLM that generates
+> the response** — so tokenize with *that* model's tokenizer (e.g. `tiktoken`
+> for GPT-4o, the target model's `tokenizer.json` for open models), not the
+> embedding model's. The embedding model's tokenizer is irrelevant to the
+> budget; embedding already happened by the time you're packing a prompt.
+
 ## Key decisions
 
 - **Embedder required at `open`** and pinned to the file — a reopen with a
@@ -166,7 +212,8 @@ rebuilt after `delete`/`clear`. Reproduce with `cargo bench`.
 - **v1** — token-budgeted scored recall; scopes; exact-dedup; versioned single-file
   store; local + API embedder examples; benchmark + CI.
 - **v1.1** — ✅ from-scratch HNSW index + ✅ on-device semantic embedder
-  (`fastembed` feature). Next: real tokenizer.
+  (`fastembed` feature) + ✅ real tokenizer (`tiktoken` / `hf-tokenizer` / `hf-hub`
+  features; pluggable `Tokenizer` trait).
 - **v2** — sidecar binary (REST / AG-UI) + Python/TS clients; LLM consolidation;
   subagent orchestration.
 - **Later** — graph/temporal memory; eval harness vs LongMemEval-style benchmarks.

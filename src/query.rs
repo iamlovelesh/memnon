@@ -12,6 +12,11 @@ pub enum Budget {
     /// Return the top `n` most similar memories.
     TopK(usize),
     /// Return the most similar memories that together fit within this many tokens.
+    ///
+    /// Counting covers memory **content only** (the bundled tokenizers count
+    /// with no special tokens added). Callers using chat/message formats should
+    /// leave headroom in the budget for per-message framing tokens (roles,
+    /// separators, etc.), which aren't counted here.
     Tokens(usize),
 }
 
