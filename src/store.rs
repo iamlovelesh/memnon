@@ -154,7 +154,11 @@ impl MemoryStore {
     ///
     /// Fails fast: an embedding or `reconcile` error aborts the whole call
     /// immediately with `Err`, but items already applied before the failing
-    /// one stay committed (no rollback across items).
+    /// one stay committed (no rollback across items) — including the cached
+    /// HNSW index, which is kept in sync with each item's commit as it
+    /// happens (not deferred to the end of the batch), so a later item's
+    /// failure never leaves the index stale relative to what's durably
+    /// stored.
     ///
     /// Embeddings are produced and validated (finite, correct dimension —
     /// same guards as [`Self::add`]) *before* every write, so a bad embedder
@@ -177,7 +181,6 @@ impl MemoryStore {
 
         let dims = self.inner.embedder.dimensions();
         let mut outcome = ConsolidationOutcome::default();
-        let mut mutated_existing = false; // any Update or Delete applied this call
 
         for entry in entries {
             let (content, metadata) = entry.into_parts();
@@ -226,31 +229,36 @@ impl MemoryStore {
                     self.inner
                         .storage
                         .apply_consolidation(&scope, &resolved, now_millis())?;
+
+                // Sync the index with THIS item's commit immediately, not after
+                // the whole batch: `apply_consolidation` commits per item, so a
+                // later item failing (fail-fast `?`) must not leave an already-
+                // committed item's effects unreflected in a cached index — a
+                // subsequent unfiltered search on a large store would otherwise
+                // consult a stale index and miss the add or match a stale
+                // embedding. Updates/deletes can shift or remove graph
+                // neighbors the HNSW index doesn't support patching in place,
+                // so drop it and let the next search rebuild. Add-only commits
+                // are cheaper to keep in sync: extend an already-built index
+                // incrementally (mirroring `add`); if no index is built yet,
+                // leave it — the next search builds one from storage, new rows
+                // included.
                 if !applied.updated.is_empty() || !applied.deleted.is_empty() {
-                    mutated_existing = true;
+                    self.invalidate_index();
+                } else if !applied.added.is_empty() {
+                    let mut guard = self.index_write();
+                    if let Some(index) = guard.as_mut() {
+                        for id in &applied.added {
+                            if let Some(memory) = self.inner.storage.get(*id)? {
+                                index.insert(*id, memory.embedding.clone());
+                            }
+                        }
+                    }
                 }
+
                 outcome.added.extend(applied.added);
                 outcome.updated.extend(applied.updated);
                 outcome.deleted.extend(applied.deleted);
-            }
-        }
-
-        // Updates/deletes can shift or remove graph neighbors the HNSW index
-        // doesn't support patching in place, so drop it and let the next
-        // search rebuild. Add-only batches are cheaper to keep in sync: extend
-        // an already-built index incrementally (mirroring `add`); if no index
-        // is built yet, leave it — the next search builds one from storage,
-        // new rows included.
-        if mutated_existing {
-            self.invalidate_index();
-        } else if !outcome.added.is_empty() {
-            let mut guard = self.index_write();
-            if let Some(index) = guard.as_mut() {
-                for id in &outcome.added {
-                    if let Some(memory) = self.inner.storage.get(*id)? {
-                        index.insert(*id, memory.embedding.clone());
-                    }
-                }
             }
         }
 

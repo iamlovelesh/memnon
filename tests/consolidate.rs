@@ -290,3 +290,99 @@ fn mid_batch_failure_is_fail_fast_and_earlier_items_stay_committed() {
     assert_eq!(out2.added.len(), 3);
     assert_eq!(s.count(&Scope::LongTerm).unwrap(), 3);
 }
+
+#[test]
+fn later_item_in_same_batch_sees_earlier_items_committed_effect() {
+    let (_d, s) = store();
+    // No existing memories; item 1 Adds a fresh fact. Item 2's rule, evaluated
+    // afterward IN THE SAME `consolidate` call, must see item 1's freshly
+    // committed row as "related" and supersede it (an Update, not a second
+    // Add) — proving related-memory retrieval is re-queried fresh per item,
+    // not snapshotted once for the whole batch.
+    let llm = Rule(|incoming: &str, rel: &[RelatedMemory]| {
+        if let Some(r) = rel.first() {
+            vec![ConsolidationOp::Update {
+                id: r.id,
+                content: incoming.to_string(),
+            }]
+        } else {
+            vec![ConsolidationOp::Add]
+        }
+    });
+
+    let out = s
+        .consolidate(
+            [
+                "the user's favorite color is blue",
+                "the user's favorite color is green",
+            ],
+            Scope::LongTerm,
+            &llm,
+        )
+        .unwrap();
+
+    assert_eq!(out.added.len(), 1);
+    assert_eq!(out.updated.len(), 1);
+    assert_eq!(out.added[0], out.updated[0], "item 2 updated item 1's row");
+    assert_eq!(s.count(&Scope::LongTerm).unwrap(), 1);
+    let m = s.get(out.added[0]).unwrap().unwrap();
+    assert_eq!(m.content, "the user's favorite color is green");
+}
+
+#[test]
+fn large_store_mid_batch_failure_keeps_hnsw_index_in_sync_with_committed_items() {
+    let (_d, s) = store();
+    // Exceed the brute-force threshold (2000) so an unfiltered search below
+    // takes the HNSW path, and give the content a token gradient so the graph
+    // stays navigable (same shape as the large-store tests in tests/store.rs).
+    let bulk: Vec<String> = (0..2100)
+        .map(|i| format!("filler memory {i} about topic {}", i % 50))
+        .collect();
+    s.add(
+        bulk.iter().map(String::as_str).collect::<Vec<_>>(),
+        Scope::LongTerm,
+    )
+    .unwrap();
+
+    // Build (and cache) the HNSW index BEFORE consolidate, so this actually
+    // exercises "is the cached index kept in sync", not "does the next search
+    // rebuild from scratch and trivially include everything".
+    let _ = s
+        .search(
+            "filler memory 5 about topic 5",
+            Query::new(),
+            Budget::TopK(3),
+        )
+        .unwrap();
+
+    let llm = ErrOnCall {
+        fail_at: 2,
+        calls: AtomicUsize::new(0),
+    };
+    let result = s.consolidate(
+        [
+            "freshly added marker about topic 5",
+            "second item that errors",
+            "third item never reached",
+        ],
+        Scope::LongTerm,
+        &llm,
+    );
+    assert!(matches!(result, Err(Error::Consolidate(_))));
+
+    // Item 1 committed before item 2's failure. If the cached HNSW index were
+    // only synced after the whole batch (the bug this test guards against),
+    // it would still lack item 1's row here, and an unfiltered large-store
+    // search would miss it.
+    let hits = s
+        .search(
+            "freshly added marker about topic 5",
+            Query::new(),
+            Budget::TopK(3),
+        )
+        .unwrap();
+    assert_eq!(
+        hits[0].memory.content, "freshly added marker about topic 5",
+        "committed item from a failed batch is missing from HNSW-backed search"
+    );
+}
