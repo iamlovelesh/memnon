@@ -799,4 +799,55 @@ mod tests {
             .unwrap();
         assert!(applied.updated.is_empty() && applied.deleted.is_empty());
     }
+
+    #[test]
+    fn apply_consolidation_multiple_adds_get_distinct_consecutive_ids_and_dedup_hit_reuses() {
+        let (_d, s) = temp_store();
+        // Seed one existing row whose content a later `Add` will collide with.
+        let seed_ids = only_ids(
+            s.insert_batch(&[item(Scope::LongTerm, "existing", vec![1.0], 5)])
+                .unwrap(),
+        );
+        let applied = s
+            .apply_consolidation(
+                &Scope::LongTerm,
+                &[
+                    ResolvedOp::Add {
+                        content: "first new".into(),
+                        metadata: HashMap::new(),
+                        embedding: vec![1.0],
+                    },
+                    ResolvedOp::Add {
+                        content: "second new".into(),
+                        metadata: HashMap::new(),
+                        embedding: vec![2.0],
+                    },
+                    // Duplicate of the seeded content: must reuse the existing id
+                    // and must NOT consume a counter slot.
+                    ResolvedOp::Add {
+                        content: "existing".into(),
+                        metadata: HashMap::new(),
+                        embedding: vec![1.0],
+                    },
+                ],
+                10,
+            )
+            .unwrap();
+        assert_eq!(applied.added.len(), 3);
+        // Two genuinely-new adds in one call get distinct, consecutive ids —
+        // the id counter is a single local value advanced per new add, not
+        // re-read from KEY_NEXT_ID per iteration.
+        assert_ne!(applied.added[0], applied.added[1]);
+        assert_eq!(applied.added[1].raw(), applied.added[0].raw() + 1);
+        // The dedup-hit add reuses the pre-existing id instead of minting one.
+        assert_eq!(applied.added[2], seed_ids[0]);
+
+        let first = s.get(applied.added[0]).unwrap().unwrap();
+        assert_eq!(first.content, "first new");
+        let second = s.get(applied.added[1]).unwrap().unwrap();
+        assert_eq!(second.content, "second new");
+
+        // Exactly two new rows were written (seed + 2), the dedup hit added none.
+        assert_eq!(s.count(&Scope::LongTerm).unwrap(), 3);
+    }
 }
