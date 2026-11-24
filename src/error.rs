@@ -32,6 +32,8 @@ pub enum Error {
     NotFound(MemoryId),
     /// A pluggable tokenizer failed to count tokens.
     Tokenizer(String),
+    /// A pluggable consolidator failed to reconcile incoming content.
+    Consolidate(String),
 }
 
 impl fmt::Display for Error {
@@ -56,6 +58,7 @@ impl fmt::Display for Error {
             Error::Embed(m) => write!(f, "embedder failed: {m}"),
             Error::NotFound(id) => write!(f, "memory not found: {id}"),
             Error::Tokenizer(m) => write!(f, "tokenizer error: {m}"),
+            Error::Consolidate(m) => write!(f, "consolidation failed: {m}"),
         }
     }
 }
