@@ -144,6 +144,47 @@ Don't have either? Implement [`Tokenizer`] yourself — it's one method,
 > embedding model's. The embedding model's tokenizer is irrelevant to the
 > budget; embedding already happened by the time you're packing a prompt.
 
+## LLM consolidation (optional)
+
+v1's `add` is append-only: it dedups exact duplicates but doesn't reconcile
+contradictions — `"likes dark mode"` then `"likes light mode"` are both
+retained and both recalled. `MemoryStore::consolidate` closes that gap via a
+pluggable [`Consolidator`] seam: for each incoming fact, memnon retrieves the
+related memories already in the given scope and asks your `Consolidator` what
+to do about it — `Add`, `Update` an existing memory, `Delete` one, or `Noop`.
+memnon applies whatever it returns and reports a tally:
+
+```rust
+use memnon::{ConsolidationOp, Consolidator, RelatedMemory, Result, Scope};
+
+struct MyConsolidator;
+impl Consolidator for MyConsolidator {
+    fn reconcile(&self, incoming: &str, related: &[RelatedMemory]) -> Result<Vec<ConsolidationOp>> {
+        // Inspect `related` (each has `id`, `content`, `score`) and decide.
+        Ok(vec![ConsolidationOp::Add])
+    }
+}
+
+let outcome = store.consolidate(
+    ["the user moved to San Francisco"],
+    Scope::LongTerm,
+    &MyConsolidator,
+)?;
+println!("{outcome:?}"); // ConsolidationOutcome { added, updated, deleted, noops }
+```
+
+`Consolidator` is model-agnostic, same as `Embedder` and `Tokenizer` — a
+closure-backed rule, a local heuristic, or an LLM call are all valid
+implementations. See `examples/openai_consolidator.rs` for a real,
+OpenAI-backed one (bring your own key/model, same bring-your-own pattern as
+`examples/openai_embedder.rs`).
+
+> **Extraction is yours, not memnon's.** `consolidate` reconciles
+> already-discrete facts against what's already stored — it does not turn a
+> raw conversation or document into those facts. Running your own
+> extraction step (an LLM call, a rule, whatever) upstream of `consolidate`
+> is the caller's responsibility.
+
 ## Key decisions
 
 - **Embedder required at `open`** and pinned to the file — a reopen with a
@@ -168,7 +209,7 @@ Build plan: [`docs/plans/2026-11-18-memnon-v1-implementation-plan.md`](docs/plan
 | Fully offline, single file | ✅ | ❌ | ✅ (vector store only) |
 | Memory semantics (scopes, recall API) | ✅ | ✅ | ❌ (you build it) |
 | **Token-budget-first recall** | ✅ | ❌ | ❌ |
-| LLM conflict resolution | ⏳ v2 | ✅ | ❌ |
+| LLM conflict resolution | ✅ (pluggable `Consolidator`) | ✅ | ❌ |
 | ANN index at scale | ✅ HNSW (approximate) | ✅ | ✅ |
 | Language reach | Rust (sidecar → any, v2) | Python-first | Rust / SQL |
 
@@ -199,11 +240,12 @@ rebuilt after `delete`/`clear`. Reproduce with `cargo bench`.
 - **Rust only (v1).** memnon is embeddable from Rust today. "SQLite for agent
   memory" in the full, every-language sense needs the **sidecar + language
   clients**, which are a deliberate later step. v1 is built to be sidecar-ready.
-- **Append-only; no conflict resolution.** memnon stores facts and dedups exact
-  duplicates, but it does **not** reconcile contradictions — add "likes dark mode"
-  then "likes light mode" and both are retained and recalled (recency breaks
-  ties). LLM-based consolidation (update/supersede) is **v2**. If you need
-  self-correcting memory today, memnon v1 isn't it yet.
+- **`add` is append-only; reconciliation is opt-in.** `add` alone dedups exact
+  duplicates but does **not** reconcile contradictions — add "likes dark mode"
+  then "likes light mode" via `add` and both are retained and recalled
+  (recency breaks ties). Use `MemoryStore::consolidate` with a pluggable
+  `Consolidator` (see *LLM consolidation* above) when you want update/supersede
+  semantics instead — it's a separate call, not `add`'s default behavior.
 - **Not a vector DB.** For raw ANN at scale, use LanceDB. memnon is the memory
   *semantics* and context-window packing on top.
 
@@ -214,8 +256,8 @@ rebuilt after `delete`/`clear`. Reproduce with `cargo bench`.
 - **v1.1** — ✅ from-scratch HNSW index + ✅ on-device semantic embedder
   (`fastembed` feature) + ✅ real tokenizer (`tiktoken` / `hf-tokenizer` / `hf-hub`
   features; pluggable `Tokenizer` trait).
-- **v2** — sidecar binary (REST / AG-UI) + Python/TS clients; LLM consolidation;
-  subagent orchestration.
+- **v2** — sidecar binary (REST / AG-UI) + Python/TS clients; ✅ LLM consolidation
+  (pluggable `Consolidator`, `MemoryStore::consolidate`); subagent orchestration.
 - **Later** — graph/temporal memory; eval harness vs LongMemEval-style benchmarks.
 
 ## License
