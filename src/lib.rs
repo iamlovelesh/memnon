@@ -26,6 +26,11 @@ mod tiktoken_tokenizer;
 #[cfg(feature = "tiktoken")]
 pub use tiktoken_tokenizer::TiktokenTokenizer;
 
+#[cfg(feature = "hf-tokenizer")]
+mod hf_tokenizer;
+#[cfg(feature = "hf-tokenizer")]
+pub use hf_tokenizer::HfTokenizer;
+
 pub use embedder::{Embedder, HashEmbedder};
 pub use error::{Error, Result};
 pub use query::{Budget, Query};

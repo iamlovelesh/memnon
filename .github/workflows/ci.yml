@@ -28,7 +28,7 @@ jobs:
         run: cargo build --examples
 
   features:
-    name: lint (fastembed, tiktoken features)
+    name: lint (fastembed, tiktoken, hf-tokenizer features)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,6 +43,8 @@ jobs:
         run: cargo clippy --features fastembed --all-targets -- -D warnings
       - name: Clippy with tiktoken
         run: cargo clippy --features tiktoken --all-targets -- -D warnings
+      - name: Clippy with hf-tokenizer
+        run: cargo clippy --features hf-tokenizer --all-targets -- -D warnings
 
   coverage:
     name: coverage (report only)

@@ -17,6 +17,9 @@ fastembed = { version = "7.7.1", optional = true }
 redb = "5.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
 tiktoken-rs = { version = "0.12.1", optional = true }
+tokenizers = { version = "0.23.2", optional = true, default-features = false, features = [
+    "fancy-regex",
+] }
 
 [dev-dependencies]
 criterion = "0.8.2"
@@ -38,3 +41,5 @@ required-features = ["fastembed"]
 fastembed = ["dep:fastembed"]
 # Optional OpenAI-compatible BPE tokenizer (tiktoken-rs), off by default.
 tiktoken = ["dep:tiktoken-rs"]
+# Optional HuggingFace tokenizer (local tokenizer.json: BERT/Llama/etc.), off by default.
+hf-tokenizer = ["dep:tokenizers"]
