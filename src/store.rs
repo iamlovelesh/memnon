@@ -1,12 +1,13 @@
 //! `MemoryStore` — the public handle that wires the embedder, storage, recall
 //! math, and the HNSW index into `add` / `search` / lifecycle operations.
 
+use crate::consolidator::{ConsolidationOp, ConsolidationOutcome, Consolidator, RelatedMemory};
 use crate::embedder::Embedder;
 use crate::error::{Error, Result};
 use crate::hnsw::HnswIndex;
 use crate::index::{pack, rank};
 use crate::query::{Budget, Query};
-use crate::storage::{MemoryInput, Storage};
+use crate::storage::{MemoryInput, ResolvedOp, Storage};
 use crate::tokenizer::{HeuristicTokenizer, Tokenizer};
 use crate::types::{Entry, Hit, Memory, MemoryId, Scope};
 use std::collections::HashMap;
@@ -19,6 +20,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const BRUTE_FORCE_THRESHOLD: usize = 2000;
 /// Minimum HNSW candidate pool, so small budgets still re-rank a healthy set.
 const HNSW_POOL_FLOOR: usize = 128;
+/// How many related memories are surfaced to a [`Consolidator`] per incoming item.
+const CONSOLIDATE_TOP_K: usize = 8;
+/// Minimum similarity score for a candidate to count as "related" during
+/// consolidation. `0.0` admits anything non-negatively similar.
+const CONSOLIDATE_MIN_SCORE: f32 = 0.0;
 
 /// A handle to a memory store backed by a single embedded file.
 ///
@@ -133,6 +139,173 @@ impl MemoryStore {
         }
 
         Ok(inserted.into_iter().map(|(id, _)| id).collect())
+    }
+
+    /// Reconcile incoming facts against what's already stored in `scope`,
+    /// delegating the merge decision (add/update/delete/no-op) to `llm`.
+    ///
+    /// Each item is processed in order: it's embedded, the most-related
+    /// existing memories in `scope` are retrieved (top [`CONSOLIDATE_TOP_K`],
+    /// scored at or above [`CONSOLIDATE_MIN_SCORE`]), `llm.reconcile` decides
+    /// what to do, and the result is applied in its own transaction before the
+    /// next item is considered — so a later item in the same batch sees the
+    /// committed effects of earlier ones. An empty `reconcile` result is
+    /// treated as a single [`ConsolidationOp::Noop`].
+    ///
+    /// Fails fast: an embedding or `reconcile` error aborts the whole call
+    /// immediately with `Err`, but items already applied before the failing
+    /// one stay committed (no rollback across items).
+    ///
+    /// Embeddings are produced and validated (finite, correct dimension —
+    /// same guards as [`Self::add`]) *before* every write, so a bad embedder
+    /// output fails the item before any transaction touches storage.
+    pub fn consolidate<I, E, L>(
+        &self,
+        items: I,
+        scope: Scope,
+        llm: &L,
+    ) -> Result<ConsolidationOutcome>
+    where
+        I: IntoIterator<Item = E>,
+        E: Into<Entry>,
+        L: Consolidator + ?Sized,
+    {
+        let entries: Vec<Entry> = items.into_iter().map(Into::into).collect();
+        if entries.is_empty() {
+            return Ok(ConsolidationOutcome::default());
+        }
+
+        let dims = self.inner.embedder.dimensions();
+        let mut outcome = ConsolidationOutcome::default();
+        let mut mutated_existing = false; // any Update or Delete applied this call
+
+        for entry in entries {
+            let (content, metadata) = entry.into_parts();
+            let incoming_embedding = self.embed_one_checked(&content, dims)?;
+
+            let related = self.related_memories(&scope, &incoming_embedding)?;
+
+            let ops = llm.reconcile(&content, &related)?;
+            let ops: Vec<ConsolidationOp> = if ops.is_empty() {
+                vec![ConsolidationOp::Noop]
+            } else {
+                ops
+            };
+
+            let mut resolved: Vec<ResolvedOp> = Vec::with_capacity(ops.len());
+            for op in ops {
+                match op {
+                    ConsolidationOp::Add => resolved.push(ResolvedOp::Add {
+                        content: content.clone(),
+                        metadata: metadata.clone(),
+                        embedding: incoming_embedding.clone(),
+                    }),
+                    ConsolidationOp::Update {
+                        id,
+                        content: new_content,
+                    } => {
+                        let embedding = self.embed_one_checked(&new_content, dims)?;
+                        resolved.push(ResolvedOp::Update {
+                            id,
+                            content: new_content,
+                            embedding,
+                        });
+                    }
+                    ConsolidationOp::Delete { id } => {
+                        resolved.push(ResolvedOp::Delete { id });
+                    }
+                    ConsolidationOp::Noop => outcome.noops += 1,
+                    // `ConsolidationOp` is `#[non_exhaustive]` for downstream crates
+                    // only; within memnon this match must stay exhaustive so a new
+                    // variant is a compile error here, not a silently-ignored op.
+                }
+            }
+
+            if !resolved.is_empty() {
+                let applied =
+                    self.inner
+                        .storage
+                        .apply_consolidation(&scope, &resolved, now_millis())?;
+                if !applied.updated.is_empty() || !applied.deleted.is_empty() {
+                    mutated_existing = true;
+                }
+                outcome.added.extend(applied.added);
+                outcome.updated.extend(applied.updated);
+                outcome.deleted.extend(applied.deleted);
+            }
+        }
+
+        // Updates/deletes can shift or remove graph neighbors the HNSW index
+        // doesn't support patching in place, so drop it and let the next
+        // search rebuild. Add-only batches are cheaper to keep in sync: extend
+        // an already-built index incrementally (mirroring `add`); if no index
+        // is built yet, leave it — the next search builds one from storage,
+        // new rows included.
+        if mutated_existing {
+            self.invalidate_index();
+        } else if !outcome.added.is_empty() {
+            let mut guard = self.index_write();
+            if let Some(index) = guard.as_mut() {
+                for id in &outcome.added {
+                    if let Some(memory) = self.inner.storage.get(*id)? {
+                        index.insert(*id, memory.embedding.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(outcome)
+    }
+
+    /// Embed a single piece of content, applying the same finiteness/dimension
+    /// guards as [`Self::add`].
+    fn embed_one_checked(&self, content: &str, dims: usize) -> Result<Vec<f32>> {
+        let mut embeddings = self.inner.embedder.embed(&[content])?;
+        let embedding = embeddings
+            .pop()
+            .ok_or_else(|| Error::Embed("embedder returned no vector for the input".into()))?;
+        if embedding.len() != dims {
+            return Err(Error::DimensionMismatch {
+                expected: dims,
+                found: embedding.len(),
+            });
+        }
+        if !is_finite(&embedding) {
+            return Err(Error::Embed(
+                "embedder returned a non-finite (NaN/inf) value".into(),
+            ));
+        }
+        Ok(embedding)
+    }
+
+    /// The top [`CONSOLIDATE_TOP_K`] memories in `scope` related to
+    /// `incoming_embedding`, scored at or above [`CONSOLIDATE_MIN_SCORE`].
+    fn related_memories(
+        &self,
+        scope: &Scope,
+        incoming_embedding: &[f32],
+    ) -> Result<Vec<RelatedMemory>> {
+        let candidates = self.inner.storage.candidates(Some(scope), &[])?;
+        let contents: HashMap<MemoryId, String> = candidates
+            .iter()
+            .map(|m| (m.id, m.content.clone()))
+            .collect();
+        let for_ranking: Vec<(MemoryId, Vec<f32>, u64)> = candidates
+            .iter()
+            .map(|m| (m.id, m.embedding.clone(), m.created_at))
+            .collect();
+        let ranked = rank(incoming_embedding, &for_ranking);
+
+        Ok(ranked
+            .into_iter()
+            .filter(|(_, score)| *score >= CONSOLIDATE_MIN_SCORE)
+            .take(CONSOLIDATE_TOP_K)
+            .filter_map(|(id, score)| {
+                contents
+                    .get(&id)
+                    .map(|content| RelatedMemory::new(id, content.clone(), score))
+            })
+            .collect())
     }
 
     /// Recall memories for `query` under `constraints`, limited by `budget`,

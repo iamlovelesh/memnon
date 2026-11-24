@@ -29,12 +29,6 @@ impl RelatedMemory {
     /// Build a related-memory view. Crate-internal: only the store assembles
     /// these (from recall results), so an external `Consolidator` can't forge
     /// fake "related" entries with ids that don't exist.
-    ///
-    /// Not yet called from production code — the store wires this in once
-    /// consolidation is plumbed through `MemoryStore` (a later task in this
-    /// feature). Allowed dead for now so clippy doesn't block this seam from
-    /// landing independently.
-    #[allow(dead_code)]
     pub(crate) fn new(id: MemoryId, content: String, score: f32) -> Self {
         Self { id, content, score }
     }

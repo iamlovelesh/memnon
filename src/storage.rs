@@ -304,12 +304,6 @@ impl Storage {
     /// Apply a resolved consolidation plan atomically: every `Add`/`Update`/`Delete`
     /// in `ops` is applied in a single write transaction, committed once. Embeddings
     /// arrive pre-computed — this stores the bytes without touching an embedder.
-    ///
-    /// Not yet called from production code — the store wires this in once
-    /// consolidation is plumbed through `MemoryStore` (a later task in this
-    /// feature). Allowed dead for now so clippy doesn't block this seam from
-    /// landing independently.
-    #[allow(dead_code)]
     pub(crate) fn apply_consolidation(
         &self,
         scope: &Scope,
@@ -420,9 +414,6 @@ impl Storage {
 /// A single resolved consolidation operation, ready to apply against storage.
 /// Embeddings are pre-computed by the caller — this type (and `apply_consolidation`)
 /// never invoke an embedder.
-///
-/// Not yet constructed from production code — see `apply_consolidation`.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) enum ResolvedOp {
     /// Insert a new memory (subject to the usual exact-dedup check).
@@ -442,9 +433,6 @@ pub(crate) enum ResolvedOp {
 }
 
 /// Ids touched by one `apply_consolidation` call, grouped by the kind of change.
-///
-/// Not yet constructed from production code — see `apply_consolidation`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AppliedIds {
     pub added: Vec<MemoryId>,
