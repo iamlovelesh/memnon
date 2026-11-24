@@ -30,6 +30,8 @@ pub enum Error {
     Embed(String),
     /// No memory exists with the given id.
     NotFound(MemoryId),
+    /// A pluggable tokenizer failed to count tokens.
+    Tokenizer(String),
 }
 
 impl fmt::Display for Error {
@@ -53,6 +55,7 @@ impl fmt::Display for Error {
             }
             Error::Embed(m) => write!(f, "embedder failed: {m}"),
             Error::NotFound(id) => write!(f, "memory not found: {id}"),
+            Error::Tokenizer(m) => write!(f, "tokenizer error: {m}"),
         }
     }
 }

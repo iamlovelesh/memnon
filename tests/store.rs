@@ -1,6 +1,8 @@
 //! End-to-end tests for `MemoryStore` using the deterministic `HashEmbedder`.
 
-use memnon::{Budget, Embedder, Entry, Error, HashEmbedder, MemoryStore, Query, Result, Scope};
+use memnon::{
+    Budget, Embedder, Entry, Error, HashEmbedder, MemoryStore, Query, Result, Scope, Tokenizer,
+};
 use std::thread;
 
 fn store() -> (tempfile::TempDir, MemoryStore) {
@@ -528,4 +530,35 @@ fn add_rejects_non_finite_embedding() {
         s.add(["x"], Scope::LongTerm),
         Err(Error::Embed(_))
     ));
+}
+
+// Counts one token per char — distinct from the chars/4 heuristic, so we can
+// prove the injected tokenizer (not the default) drives packing.
+struct PerCharTokenizer;
+impl Tokenizer for PerCharTokenizer {
+    fn count_tokens(&self, text: &str) -> usize {
+        text.chars().count()
+    }
+}
+
+#[test]
+fn open_with_tokenizer_packs_by_injected_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.db");
+    let s =
+        MemoryStore::open_with_tokenizer(&path, HashEmbedder::new(64), PerCharTokenizer).unwrap();
+    s.add(["aaaa", "bb"], Scope::LongTerm).unwrap(); // 4 and 2 tokens under PerChar
+    // Budget of 3 tokens: "aaaa"(4) overflows and is skipped, "bb"(2) fits.
+    let hits = s.search("bb", Query::new(), Budget::Tokens(3)).unwrap();
+    assert!(hits.iter().any(|h| h.memory.content == "bb"));
+    assert!(hits.iter().all(|h| h.memory.content != "aaaa"));
+}
+
+#[test]
+fn default_open_still_uses_heuristic() {
+    // "aaaa" is 1 token under chars/4 (ceil(4/4)); with Budget::Tokens(1) it fits.
+    let (_d, s) = store(); // existing helper: MemoryStore::open with HashEmbedder
+    s.add(["aaaa"], Scope::LongTerm).unwrap();
+    let hits = s.search("aaaa", Query::new(), Budget::Tokens(1)).unwrap();
+    assert_eq!(hits.len(), 1);
 }

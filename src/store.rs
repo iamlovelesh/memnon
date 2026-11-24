@@ -4,9 +4,10 @@
 use crate::embedder::Embedder;
 use crate::error::{Error, Result};
 use crate::hnsw::HnswIndex;
-use crate::index::{approx_tokens, pack, rank};
+use crate::index::{pack, rank};
 use crate::query::{Budget, Query};
 use crate::storage::{MemoryInput, Storage};
+use crate::tokenizer::{HeuristicTokenizer, Tokenizer};
 use crate::types::{Entry, Hit, Memory, MemoryId, Scope};
 use std::collections::HashMap;
 use std::path::Path;
@@ -30,6 +31,7 @@ pub struct MemoryStore {
 struct Inner {
     storage: Storage,
     embedder: Arc<dyn Embedder>,
+    tokenizer: Arc<dyn Tokenizer>,
     /// Cached HNSW index: lazily built, incrementally extended on `add`, and
     /// dropped (rebuilt on next use) on `delete`/`clear`.
     index: RwLock<Option<HnswIndex>>,
@@ -38,7 +40,20 @@ struct Inner {
 impl MemoryStore {
     /// Open (or create) a store at `path`, pinning `embedder` to the file. A
     /// reopen with a mismatched embedder returns [`Error::EmbedderMismatch`].
+    ///
+    /// Uses [`HeuristicTokenizer`] for token-budget counting; see
+    /// [`Self::open_with_tokenizer`] to inject a different one.
     pub fn open<E: Embedder + 'static>(path: impl AsRef<Path>, embedder: E) -> Result<Self> {
+        Self::open_with_tokenizer(path, embedder, HeuristicTokenizer)
+    }
+
+    /// Like [`Self::open`], but with an explicit [`Tokenizer`] for token-budget
+    /// counting (e.g. a model-specific tokenizer instead of the built-in heuristic).
+    pub fn open_with_tokenizer<E: Embedder + 'static, T: Tokenizer + 'static>(
+        path: impl AsRef<Path>,
+        embedder: E,
+        tokenizer: T,
+    ) -> Result<Self> {
         let storage = Storage::open(path)?;
         let (pinned_identity, pinned_dims) =
             storage.init_embedder_identity_atomic(embedder.identity(), embedder.dimensions())?;
@@ -52,6 +67,7 @@ impl MemoryStore {
             inner: Arc::new(Inner {
                 storage,
                 embedder: Arc::new(embedder),
+                tokenizer: Arc::new(tokenizer),
                 index: RwLock::new(None),
             }),
         })
@@ -192,7 +208,7 @@ impl MemoryStore {
 
         let tokens: HashMap<MemoryId, usize> = candidates
             .iter()
-            .map(|m| (m.id, approx_tokens(&m.content)))
+            .map(|m| (m.id, self.inner.tokenizer.count_tokens(&m.content)))
             .collect();
         let selected = pack(&ranked, &tokens, budget, min_score);
 
