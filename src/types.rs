@@ -92,7 +92,9 @@ pub enum Scope {
     Custom(String),
 }
 
-/// A stored memory. `updated_at == created_at` in v1 (append-only).
+/// A stored memory. `created_at` is fixed at insertion; `updated_at` advances
+/// when a memory is superseded by consolidation (its content/embedding replaced
+/// in place while the id is preserved).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Memory {
@@ -103,9 +105,9 @@ pub struct Memory {
     // internal representation can change without a breaking change.
     pub(crate) embedding: Vec<f32>,
     pub metadata: HashMap<String, String>,
-    /// Unix epoch milliseconds.
+    /// Unix epoch milliseconds. Fixed at insertion time.
     pub created_at: u64,
-    /// Unix epoch milliseconds. Equals `created_at` in v1.
+    /// Unix epoch milliseconds. Advances when consolidation supersedes this memory.
     pub updated_at: u64,
 }
 

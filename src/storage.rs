@@ -300,6 +300,156 @@ impl Storage {
         }
         Ok(seen)
     }
+
+    /// Apply a resolved consolidation plan atomically: every `Add`/`Update`/`Delete`
+    /// in `ops` is applied in a single write transaction, committed once. Embeddings
+    /// arrive pre-computed — this stores the bytes without touching an embedder.
+    ///
+    /// Not yet called from production code — the store wires this in once
+    /// consolidation is plumbed through `MemoryStore` (a later task in this
+    /// feature). Allowed dead for now so clippy doesn't block this seam from
+    /// landing independently.
+    #[allow(dead_code)]
+    pub(crate) fn apply_consolidation(
+        &self,
+        scope: &Scope,
+        ops: &[ResolvedOp],
+        now: u64,
+    ) -> Result<AppliedIds> {
+        let wtxn = self.db.begin_write().map_err(io)?;
+        let mut applied = AppliedIds::default();
+        {
+            let mut memories = wtxn.open_table(MEMORIES).map_err(io)?;
+            let mut meta = wtxn.open_table(META).map_err(io)?;
+            let mut dedup = wtxn.open_table(DEDUP).map_err(io)?;
+
+            let mut next = meta
+                .get(KEY_NEXT_ID)
+                .map_err(io)?
+                .map(|g| read_u64(g.value()))
+                .transpose()?
+                .unwrap_or(1);
+
+            for op in ops {
+                match op {
+                    ResolvedOp::Add {
+                        content,
+                        metadata,
+                        embedding,
+                    } => {
+                        let dkey = dedup_key(scope, content);
+                        if let Some(found) = dedup.get(dkey.as_str()).map_err(io)? {
+                            applied.added.push(MemoryId::new(found.value()));
+                            continue;
+                        }
+                        let id = next;
+                        next += 1;
+                        let mem = Memory {
+                            id: MemoryId::new(id),
+                            scope: scope.clone(),
+                            content: content.clone(),
+                            embedding: embedding.clone(),
+                            metadata: metadata.clone(),
+                            created_at: now,
+                            updated_at: now,
+                        };
+                        memories
+                            .insert(id, encode_record(&mem)?.as_slice())
+                            .map_err(io)?;
+                        dedup.insert(dkey.as_str(), id).map_err(io)?;
+                        applied.added.push(MemoryId::new(id));
+                    }
+                    ResolvedOp::Update {
+                        id,
+                        content,
+                        embedding,
+                    } => {
+                        let existing = memories
+                            .get(id.raw())
+                            .map_err(io)?
+                            .map(|v| decode_record(v.value()))
+                            .transpose()?;
+                        let Some(old) = existing else {
+                            continue;
+                        };
+                        dedup
+                            .remove(dedup_key(&old.scope, &old.content).as_str())
+                            .map_err(io)?;
+                        let mem = Memory {
+                            id: old.id,
+                            scope: old.scope.clone(),
+                            content: content.clone(),
+                            embedding: embedding.clone(),
+                            metadata: old.metadata,
+                            created_at: old.created_at,
+                            updated_at: now,
+                        };
+                        memories
+                            .insert(id.raw(), encode_record(&mem)?.as_slice())
+                            .map_err(io)?;
+                        dedup
+                            .insert(dedup_key(&mem.scope, content).as_str(), id.raw())
+                            .map_err(io)?;
+                        applied.updated.push(*id);
+                    }
+                    ResolvedOp::Delete { id } => {
+                        let existing = memories
+                            .get(id.raw())
+                            .map_err(io)?
+                            .map(|v| decode_record(v.value()))
+                            .transpose()?;
+                        let Some(old) = existing else {
+                            continue;
+                        };
+                        memories.remove(id.raw()).map_err(io)?;
+                        dedup
+                            .remove(dedup_key(&old.scope, &old.content).as_str())
+                            .map_err(io)?;
+                        applied.deleted.push(*id);
+                    }
+                }
+            }
+            meta.insert(KEY_NEXT_ID, next.to_le_bytes().as_slice())
+                .map_err(io)?;
+        }
+        wtxn.commit().map_err(io)?;
+        Ok(applied)
+    }
+}
+
+/// A single resolved consolidation operation, ready to apply against storage.
+/// Embeddings are pre-computed by the caller — this type (and `apply_consolidation`)
+/// never invoke an embedder.
+///
+/// Not yet constructed from production code — see `apply_consolidation`.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) enum ResolvedOp {
+    /// Insert a new memory (subject to the usual exact-dedup check).
+    Add {
+        content: String,
+        metadata: HashMap<String, String>,
+        embedding: Vec<f32>,
+    },
+    /// Replace an existing memory's content/embedding in place, advancing `updated_at`.
+    Update {
+        id: MemoryId,
+        content: String,
+        embedding: Vec<f32>,
+    },
+    /// Remove an existing memory.
+    Delete { id: MemoryId },
+}
+
+/// Ids touched by one `apply_consolidation` call, grouped by the kind of change.
+///
+/// Not yet constructed from production code — see `apply_consolidation`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AppliedIds {
+    pub added: Vec<MemoryId>,
+    pub updated: Vec<MemoryId>,
+    pub deleted: Vec<MemoryId>,
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -579,5 +729,74 @@ mod tests {
         assert_eq!(s.clear(&Scope::Session).unwrap(), 1);
         assert_eq!(s.count(&Scope::Session).unwrap(), 0);
         assert_eq!(s.count(&Scope::LongTerm).unwrap(), 1);
+    }
+
+    #[test]
+    fn apply_consolidation_add_update_delete_in_one_txn() {
+        let (_d, s) = temp_store();
+        // seed two rows via insert_batch
+        let ids = only_ids(
+            s.insert_batch(&[
+                item(Scope::LongTerm, "lives in NYC", vec![1.0], 10),
+                item(Scope::LongTerm, "dup", vec![1.0], 10),
+            ])
+            .unwrap(),
+        );
+        let applied = s
+            .apply_consolidation(
+                &Scope::LongTerm,
+                &[
+                    ResolvedOp::Update {
+                        id: ids[0],
+                        content: "lives in SF".into(),
+                        embedding: vec![2.0],
+                    },
+                    ResolvedOp::Delete { id: ids[1] },
+                    ResolvedOp::Add {
+                        content: "new fact".into(),
+                        metadata: HashMap::new(),
+                        embedding: vec![3.0],
+                    },
+                ],
+                99,
+            )
+            .unwrap();
+        assert_eq!(applied.updated, vec![ids[0]]);
+        assert_eq!(applied.deleted, vec![ids[1]]);
+        assert_eq!(applied.added.len(), 1);
+        let m = s.get(ids[0]).unwrap().unwrap();
+        assert_eq!(m.content, "lives in SF");
+        assert_eq!(m.embedding, vec![2.0]);
+        assert_eq!(m.created_at, 10); // preserved
+        assert_eq!(m.updated_at, 99); // advanced
+        assert!(s.get(ids[1]).unwrap().is_none());
+        // dedup rewritten: old content re-adds fresh, new content dedups
+        let re = only_ids(
+            s.insert_batch(&[item(Scope::LongTerm, "lives in NYC", vec![1.0], 1)])
+                .unwrap(),
+        );
+        assert_ne!(re[0], ids[0]);
+    }
+
+    #[test]
+    fn apply_consolidation_tolerates_missing_ids() {
+        let (_d, s) = temp_store();
+        let applied = s
+            .apply_consolidation(
+                &Scope::LongTerm,
+                &[
+                    ResolvedOp::Update {
+                        id: MemoryId::new(999),
+                        content: "x".into(),
+                        embedding: vec![1.0],
+                    },
+                    ResolvedOp::Delete {
+                        id: MemoryId::new(1000),
+                    },
+                ],
+                1,
+            )
+            .unwrap();
+        assert!(applied.updated.is_empty() && applied.deleted.is_empty());
     }
 }
