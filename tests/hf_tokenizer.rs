@@ -21,3 +21,11 @@ fn malformed_bytes_error() {
         Err(Error::Tokenizer(_))
     ));
 }
+
+#[test]
+#[cfg(feature = "hf-hub")]
+#[ignore = "downloads a tokenizer.json from the HF Hub; run manually"]
+fn from_pretrained_fetches_and_counts() {
+    let t = HfTokenizer::from_pretrained("bert-base-uncased").unwrap();
+    assert!(t.count_tokens("hello world") >= 2);
+}

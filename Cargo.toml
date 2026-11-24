@@ -43,3 +43,7 @@ fastembed = ["dep:fastembed"]
 tiktoken = ["dep:tiktoken-rs"]
 # Optional HuggingFace tokenizer (local tokenizer.json: BERT/Llama/etc.), off by default.
 hf-tokenizer = ["dep:tokenizers"]
+# Optional Hub-by-name download (fetches tokenizer.json over HTTP, then caches),
+# off by default. Implies `hf-tokenizer`; enables `tokenizers`' own `http`
+# feature, which pulls in `hf-hub` internally (no separate dependency needed here).
+hf-hub = ["hf-tokenizer", "tokenizers/http"]

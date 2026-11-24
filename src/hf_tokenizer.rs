@@ -34,6 +34,22 @@ impl HfTokenizer {
             .map_err(|e| Error::Tokenizer(e.to_string()))?;
         Ok(Self { inner })
     }
+
+    /// Load a tokenizer by HuggingFace Hub model id (e.g. `"bert-base-uncased"`).
+    ///
+    /// Downloads the model's `tokenizer.json` on first use and caches it
+    /// locally (via the Hub's standard cache directory), so this call hits
+    /// the network the first time and is offline thereafter. Behind the
+    /// `hf-hub` feature.
+    ///
+    /// Returns `Err(Error::Tokenizer)` if the download fails or the id is
+    /// unknown.
+    #[cfg(feature = "hf-hub")]
+    pub fn from_pretrained(model_id: &str) -> Result<Self> {
+        let inner = tokenizers::Tokenizer::from_pretrained(model_id, None)
+            .map_err(|e| Error::Tokenizer(e.to_string()))?;
+        Ok(Self { inner })
+    }
 }
 
 impl Tokenizer for HfTokenizer {
