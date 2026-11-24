@@ -9,6 +9,7 @@ pub mod embedder;
 pub mod error;
 pub mod query;
 pub mod store;
+pub mod tokenizer;
 pub mod types;
 
 pub(crate) mod hnsw;
@@ -24,4 +25,5 @@ pub use embedder::{Embedder, HashEmbedder};
 pub use error::{Error, Result};
 pub use query::{Budget, Query};
 pub use store::MemoryStore;
+pub use tokenizer::{HeuristicTokenizer, Tokenizer};
 pub use types::{Entry, Hit, Memory, MemoryId, Scope};
